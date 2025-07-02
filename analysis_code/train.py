@@ -276,7 +276,7 @@ def trainSegmentationStep(model, dataloader, criterion, optimizer, device):
         running_loss += loss.item()
     return running_loss / len(dataloader)
 
-def validateSegmentationStep(model, dataloader, criterion, optimizer, device):
+def validateSegmentationStep(model, dataloader, criterion, device):
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -424,13 +424,13 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
 
         seg_train_loss = trainSegmentationStep(model, seg_train_loader, seg_criterion, optimizer, device)
         print(f"Epoch {epoch+1}/{num_epochs}, Segmentation Train Loss: {seg_train_loss:.4f}")
-        seg_val_loss = validateSegmentationStep(model, seg_val_loader, seg_criterion, optimizer, device)
+        seg_val_loss = validateSegmentationStep(model, seg_val_loader, seg_criterion, device)
         print(f"Segmentation Validation Loss: {seg_val_loss / len(seg_val_loader):.4f}")
 
         mlc_train_loss = trainMLCStep(model, mlc_train_loader, mlc_criterion, optimizer, device)
-        print(f"Segmentation Train Loss: {mlc_train_loss:.4f}")
-        mlc_val_loss, val_f1, val_ap = validateMLCStep(model, mlc_val_loader, mlc_criterion, optimizer, device)
-        print(f"Segmentation Validation Loss: {mlc_val_loss:.4f}, F1: {val_f1:.4f}")
+        print(f"CVS Classification Train Loss: {mlc_train_loss:.4f}")
+        mlc_val_loss, val_f1, val_ap = validateMLCStep(model, mlc_val_loader, mlc_criterion, device)
+        print(f"CVS Classification Loss: {mlc_val_loss:.4f}, F1: {val_f1:.4f}")
         for i, ap in enumerate(val_ap):
             print(f"Average Precision for class {i}: {ap:.4f}")
 
