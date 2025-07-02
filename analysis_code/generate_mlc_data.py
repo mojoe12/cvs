@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 # === Load the input CSV ===
-input_path = "analysis/combined_frame_interpolated.csv"
+input_path = "analysis/combined_frame.csv"
 df = pd.read_csv(input_path)
 
 # === Construct 'image' column ===
@@ -10,22 +10,22 @@ df["image"] = df["dir_name"] + "_" + df["frame_id"].astype(str) + ".jpg"
 
 # === Compute temp_c1, temp_c2, temp_c3 ===
 df["temp_c1"] = 0.5 + (
-    (df["c1_rater1"] - 0.5) * df["c1_rater1_confidence_time"] +
-    (df["c1_rater2"] - 0.5) * df["c1_rater2_confidence_time"] +
-    (df["c1_rater3"] - 0.5) * df["c1_rater3_confidence_time"]
-) / (df["c1_rater1_confidence_time"] + df["c1_rater2_confidence_time"] + df["c1_rater3_confidence_time"])
+    (df["c1_rater1"] - 0.5) +
+    (df["c1_rater2"] - 0.5) +
+    (df["c1_rater3"] - 0.5)
+) / 3
 
 df["temp_c2"] = 0.5 + (
-    (df["c2_rater1"] - 0.5) * df["c2_rater1_confidence_time"] +
-    (df["c2_rater2"] - 0.5) * df["c2_rater2_confidence_time"] +
-    (df["c2_rater3"] - 0.5) * df["c2_rater3_confidence_time"]
-) / (df["c2_rater1_confidence_time"] + df["c2_rater2_confidence_time"] + df["c2_rater3_confidence_time"])
+    (df["c2_rater1"] - 0.5) +
+    (df["c2_rater2"] - 0.5) +
+    (df["c2_rater3"] - 0.5)
+) / 3
 
 df["temp_c3"] = 0.5 + (
-    (df["c3_rater1"] - 0.5) * df["c3_rater1_confidence_time"] +
-    (df["c3_rater2"] - 0.5) * df["c3_rater2_confidence_time"] +
-    (df["c3_rater3"] - 0.5) * df["c3_rater3_confidence_time"]
-) / (df["c3_rater1_confidence_time"] + df["c3_rater2_confidence_time"] + df["c3_rater3_confidence_time"])
+    (df["c3_rater1"] - 0.5) +
+    (df["c3_rater2"] - 0.5) +
+    (df["c3_rater3"] - 0.5)
+) / 3
 
 # === Compute rounded final class values ===
 df["c1"] = df["temp_c1"].round().astype(int)
@@ -33,20 +33,9 @@ df["c2"] = df["temp_c2"].round().astype(int)
 df["c3"] = df["temp_c3"].round().astype(int)
 
 # === Compute confidence scores ===
-df["confidence_c1"] = (
-    2 * abs(0.5 - df["temp_c1"]) *
-    (df["c1_rater1_confidence_time"] + df["c1_rater2_confidence_time"] + df["c1_rater3_confidence_time"]) / 3
-)
-
-df["confidence_c2"] = (
-    2 * abs(0.5 - df["temp_c2"]) *
-    (df["c2_rater1_confidence_time"] + df["c2_rater2_confidence_time"] + df["c2_rater3_confidence_time"]) / 3
-)
-
-df["confidence_c3"] = (
-    2 * abs(0.5 - df["temp_c3"]) *
-    (df["c3_rater1_confidence_time"] + df["c3_rater2_confidence_time"] + df["c3_rater3_confidence_time"]) / 3
-)
+df["confidence_c1"] = 2 * abs(0.5 - df["temp_c1"])
+df["confidence_c2"] = 2 * abs(0.5 - df["temp_c2"])
+df["confidence_c3"] = 2 * abs(0.5 - df["temp_c3"])
 
 # === Compute positive class counts ===
 pos_c1 = df["c1"].sum()
@@ -70,7 +59,7 @@ output_df = df[[
 ]]
 
 # === Save the final CSV ===
-output_path = "analysis/mlc_data.csv"
+output_path = "analysis/mlc_data_no_interpolation.csv"
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 output_df.to_csv(output_path, index=False)
 
