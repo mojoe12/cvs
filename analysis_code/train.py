@@ -5,7 +5,9 @@ from torchvision import models, transforms
 from torchvision.transforms import functional as TF
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score
+from torchvision.ops import FeaturePyramidNetwork
 from pycocotools.coco import COCO
+import timm
 import skimage.transform as st
 import numpy as np
 from PIL import Image
@@ -79,28 +81,16 @@ class CocoSegmentationDataset(Dataset):
         # Convert mask to torch tensor
         return image, mask
 
-def getSegmentationLoaders(batch_size, h, w):
-    # ---- CONFIG ----
-    coco_annotation_path = 'analysis/'
-    image_root_dir = 'sages_cvs_challenge_2025/segmentation_visualization/'  # Set this to the folder with your images
-
-    # Create two dataset instances with different augment flags
-    train_dataset = CocoSegmentationDataset(coco_annotation_path + 'instances_train.json', image_root_dir, h, w, augment=True)
-    val_dataset = CocoSegmentationDataset(coco_annotation_path + 'instances_val.json', image_root_dir, h, w, augment=False)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,  # Set to 0 while debugging
-    )
-    val_loader = DataLoader(
-        val_dataset,
+def getSegmentationLoader(json_file, image_dir, augment, h, w, batch_size):
+    # Create dataset instance
+    dataset = CocoSegmentationDataset(json_file, image_dir, h, w, augment=augment)
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=4,
     )
-    return train_loader, val_loader
+    return loader
 
 class MultiLabelImageDataset(Dataset):
     def __init__(self, image_dir, labels_and_confidences, height, width, augment):
@@ -142,44 +132,27 @@ class MultiLabelImageDataset(Dataset):
         confidence = torch.tensor(confidence, dtype=torch.float32)
         return image, label, confidence
 
-def getMLCLoaders(batch_size, h, w):
+def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     # Transforms
-    train_df = pd.read_csv('analysis/train_mlc_data.csv')
-    val_df = pd.read_csv('analysis/val_mlc_data.csv')
-    image_path = 'sages_cvs_challenge_2025/frames'
+    my_df = pd.read_csv(csv_file)
 
-    train_dict = {
+    labels_confidences_dict = {
         row['image']: (
             [row['c1'], row['c2'], row['c3']],
             [row['weight_c1'], row['weight_c2'], row['weight_c3']]
         )
-        for _, row in train_df.iterrows()
-    }
-    val_dict = {
-        row['image']: (
-            [row['c1'], row['c2'], row['c3']],
-            [row['weight_c1'], row['weight_c2'], row['weight_c3']]
-        )
-        for _, row in val_df.iterrows()
+        for _, row in my_df.iterrows()
     }
 
-    # Create two dataset instances with different augment flags
-    train_dataset = MultiLabelImageDataset(image_path, train_dict, h, w, augment=True)
-    val_dataset = MultiLabelImageDataset(image_path, val_dict, h, w, augment=False)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,  # Set to 0 while debugging
-    )
-    val_loader = DataLoader(
-        val_dataset,
+    # Create dataset instance
+    dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=augment)
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=4,
     )
-    return train_loader, val_loader
+    return loader
 
 class EfficientNetMultiHead(nn.Module):
     def __init__(self, num_labels, num_classes):
@@ -224,22 +197,14 @@ class EfficientNetMultiHead(nn.Module):
             nn.Conv2d(16, num_classes, kernel_size=1)
         )
 
-    def forward(self, x, task='classification'):
+    def forward(self, x, task):
         features = self.features(x)
 
         if task == 'classification':
             pooled = self.pool(features)
             return self.classifier(pooled)
-
         elif task == 'segmentation':
             return self.segmentation_head(features)
-
-        elif task == 'both':
-            pooled = self.pool(features)
-            cls_out = self.classifier(pooled)
-            seg_out = self.segmentation_head(features)
-            return cls_out, seg_out
-
         else:
             raise ValueError(f"Unknown task: {task}")
 
@@ -334,7 +299,7 @@ def unfreeze_backbone(model):
     for param in model.features.parameters():
         param.requires_grad = True
 
-def logSegmentationResults(log_dir, seg_val_loader, model, device):
+def logSegmentationResults(log_dir, val_seg_loader, model, device):
     os.makedirs(log_dir, exist_ok=True)
 
     model.eval()
@@ -342,7 +307,7 @@ def logSegmentationResults(log_dir, seg_val_loader, model, device):
     all_labels = []
 
     with torch.no_grad():
-        for batch_idx, (images, masks) in enumerate(seg_val_loader):
+        for batch_idx, (images, masks) in enumerate(val_seg_loader):
             images = images.to(device)
             masks = masks.to(device)
             outputs = model(images, 'segmentation')
@@ -389,7 +354,7 @@ def logSegmentationResults(log_dir, seg_val_loader, model, device):
     plt.savefig(f"{log_dir}/confusion_matrix.png")
     plt.close()
 
-def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, seg_train_loader, seg_val_loader, mlc_train_loader, mlc_val_loader):
+def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     mlc_criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
     seg_criterion = torch.nn.CrossEntropyLoss()
@@ -403,23 +368,38 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
             unfreeze_backbone(model)
             print("Unfroze the backbone")
 
-        seg_train_loss = trainSegmentationStep(model, seg_train_loader, seg_criterion, optimizer, device)
-        print(f"Epoch {epoch+1}/{num_epochs}, Segmentation Train Loss: {seg_train_loss:.4f}")
-        seg_val_loss = validateSegmentationStep(model, seg_val_loader, seg_criterion, device)
-        print(f"Segmentation Validation Loss: {seg_val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        for d, train_seg_loader in enumerate(train_seg_loaders):
+            train_seg_loss = trainSegmentationStep(model, train_seg_loader, seg_criterion, optimizer, device)
+            print(f"Dataset {d} Segmentation Train Loss: {train_seg_loss:.4f}")
 
-        mlc_train_loss = trainMLCStep(model, mlc_train_loader, mlc_criterion, optimizer, device)
-        print(f"CVS Classification Train Loss: {mlc_train_loss:.4f}")
-        mlc_val_loss, val_f1, val_ap = validateMLCStep(model, mlc_val_loader, mlc_criterion, device)
-        print(f"CVS Classification Validation Loss: {mlc_val_loss:.4f}, F1: {val_f1:.4f}")
-        for i, ap in enumerate(val_ap):
-            print(f"Average Precision for c{i+1}: {ap:.4f}")
+        for d, train_mlc_loader in enumerate(train_mlc_loaders):
+            train_mlc_loss = trainMLCStep(model, train_mlc_loader, mlc_criterion, optimizer, device)
+            print(f"Dataset {d} CVS Classification Train Loss: {train_mlc_loss:.4f}")
+
+        for d, val_seg_loader in enumerate(val_seg_loaders):
+            val_seg_loss = validateSegmentationStep(model, val_seg_loader, seg_criterion, device)
+            print(f"Dataset {d} Segmentation Validation Loss: {val_seg_loss:.4f}")
+
+        for d, val_mlc_loader in enumerate(val_mlc_loaders):
+            val_mlc_loss, val_f1, val_ap = validateMLCStep(model, val_mlc_loader, mlc_criterion, device)
+            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, F1: {val_f1:.4f}")
+            for i, ap in enumerate(val_ap):
+                print(f"Average Precision for c{i+1}: {ap:.4f}")
 
 def main():
     seg_batch_size, mlc_batch_size = 20, 40
     h, w = 300, 300
-    train_seg_loader, val_seg_loader = getSegmentationLoaders(seg_batch_size, h, w)
-    train_mlc_loader, val_mlc_loader = getMLCLoaders(mlc_batch_size, h, w)
+    endo_train_seg_loader = getSegmentationLoader('endoscapes/train_seg/annotation_coco.json', 'endoscapes/train_seg', True, h, w, seg_batch_size)
+    endo_val_seg_loader = getSegmentationLoader('endoscapes/val_seg/annotation_coco.json', 'endoscapes/val_seg', False, h, w, seg_batch_size)
+    endo_test_seg_loader = getSegmentationLoader('endoscapes/test_seg/annotation_coco.json', 'endoscapes/test_seg', False, h, w, seg_batch_size)
+    cvs_train_seg_loader = getSegmentationLoader('analysis/instances_train.json', 'sages_cvs_challenge_2025/segmentation_visualization/', True, h, w, seg_batch_size)
+    cvs_val_seg_loader = getSegmentationLoader('analysis/instances_val.json', 'sages_cvs_challenge_2025/segmentation_visualization/', False, h, w, seg_batch_size)
+    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size)
+    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size)
+    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size)
+    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size)
+    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size)
 
     num_labels = 3
     num_classes = 7
@@ -432,8 +412,12 @@ def main():
         {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
         {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
     ])
-    train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loader, val_seg_loader, train_mlc_loader, val_mlc_loader)
-    logSegmentationResults('segmentation_results', seg_val_loader, model, device)
+    train_seg_loaders = [cvs_train_seg_loader, endo_train_seg_loader, endo_val_seg_loader, endo_test_seg_loader]
+    val_seg_loaders = [cvs_val_seg_loader]
+    train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader]
+    val_mlc_loaders = [cvs_val_mlc_loader, endo_val_mlc_loader, endo_test_mlc_loader]
+    train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders)
+    logSegmentationResults('endo_segmentation_results', endo_val_seg_loader, model, device)
 
 if __name__ == "__main__":
     main()
