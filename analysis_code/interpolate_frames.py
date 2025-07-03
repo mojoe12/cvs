@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # Load the original CSV
-df = pd.read_csv('analysis/combined_frame.csv')
+df = pd.read_csv('analysis/train_frames.csv')
 
 # Sort just in case
 df = df.sort_values(by=['dir_name', 'frame_id'])
@@ -43,7 +43,7 @@ def interpolate_group(group):
 df_interp = df.groupby('dir_name', group_keys=False).apply(interpolate_group)
 
 # Save to new CSV
-df_interp.to_csv('analysis/combined_frame_interpolated.csv', index=False)
+df_interp.to_csv('analysis/train_frame_interpolated.csv', index=False)
 
 print("Interpolated data with uncertainty saved.")
 

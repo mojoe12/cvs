@@ -81,26 +81,12 @@ class CocoSegmentationDataset(Dataset):
 
 def getSegmentationLoaders(batch_size, h, w):
     # ---- CONFIG ----
-    coco_annotation_path = 'sages_cvs_challenge_2025/segmentation_labels/sages_cvs_segmentation_2025.json'
+    coco_annotation_path = 'analysis/'
     image_root_dir = 'sages_cvs_challenge_2025/segmentation_visualization/'  # Set this to the folder with your images
 
-    # Full dataset object (no split yet)
-    full_dataset = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=False)
-
-    # Create a consistent train/val split
-    total_indices = list(range(len(full_dataset)))
-    random.shuffle(total_indices)
-    val_size = int(0.2 * len(full_dataset))
-    val_indices = total_indices[:val_size]
-    train_indices = total_indices[val_size:]
-
     # Create two dataset instances with different augment flags
-    train_dataset_full = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=True)
-    val_dataset_full = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=False)
-
-    # Subset them using the precomputed indices
-    train_dataset = Subset(train_dataset_full, train_indices)
-    val_dataset = Subset(val_dataset_full, val_indices)
+    train_dataset = CocoSegmentationDataset(coco_annotation_path + 'instances_train.json', image_root_dir, h, w, augment=True)
+    val_dataset = CocoSegmentationDataset(coco_annotation_path + 'instances_val.json', image_root_dir, h, w, augment=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -158,33 +144,28 @@ class MultiLabelImageDataset(Dataset):
 
 def getMLCLoaders(batch_size, h, w):
     # Transforms
-    lc_df = pd.read_csv('analysis/mlc_data.csv')
+    train_df = pd.read_csv('analysis/train_mlc_data.csv')
+    val_df = pd.read_csv('analysis/val_mlc_data.csv')
+    image_path = 'sages_cvs_challenge_2025/frames'
 
-    labels_confidences_dict = {
+    train_dict = {
         row['image']: (
             [row['c1'], row['c2'], row['c3']],
             [row['weight_c1'], row['weight_c2'], row['weight_c3']]
         )
-        for _, row in lc_df.iterrows()
+        for _, row in train_df.iterrows()
+    }
+    val_dict = {
+        row['image']: (
+            [row['c1'], row['c2'], row['c3']],
+            [row['weight_c1'], row['weight_c2'], row['weight_c3']]
+        )
+        for _, row in val_df.iterrows()
     }
 
-    # Datasets
-    image_path = 'sages_cvs_challenge_2025/frames'
-    full_dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=False)
-    # Create a consistent train/val split
-    total_indices = list(range(len(full_dataset)))
-    random.shuffle(total_indices)
-    val_size = int(0.2 * len(full_dataset))
-    val_indices = total_indices[:val_size]
-    train_indices = total_indices[val_size:]
-
     # Create two dataset instances with different augment flags
-    train_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=True)
-    val_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=False)
-
-    # Subset them using the precomputed indices
-    train_dataset = Subset(train_dataset_full, train_indices)
-    val_dataset = Subset(val_dataset_full, val_indices)
+    train_dataset = MultiLabelImageDataset(image_path, train_dict, h, w, augment=True)
+    val_dataset = MultiLabelImageDataset(image_path, val_dict, h, w, augment=False)
 
     train_loader = DataLoader(
         train_dataset,
