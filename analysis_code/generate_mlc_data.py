@@ -28,14 +28,14 @@ df["temp_c3"] = 0.5 + (
 ) / 3
 
 # === Compute rounded final class values ===
-df["c1"] = df["temp_c1"].round().astype(int)
-df["c2"] = df["temp_c2"].round().astype(int)
-df["c3"] = df["temp_c3"].round().astype(int)
+df["c1"] = df["temp_c1"]
+df["c2"] = df["temp_c2"]
+df["c3"] = df["temp_c3"]
 
 # === Compute confidence scores ===
-df["confidence_c1"] = 2 * abs(0.5 - df["temp_c1"])
-df["confidence_c2"] = 2 * abs(0.5 - df["temp_c2"])
-df["confidence_c3"] = 2 * abs(0.5 - df["temp_c3"])
+df["confidence_c1"] = 1#2 * abs(0.5 - df["temp_c1"])
+df["confidence_c2"] = 1#2 * abs(0.5 - df["temp_c2"])
+df["confidence_c3"] = 1#2 * abs(0.5 - df["temp_c3"])
 
 # === Compute positive class counts ===
 pos_c1 = df["c1"].sum()
@@ -49,9 +49,9 @@ w_c2 = df["c2"].sum() / N
 w_c3 = df["c3"].sum() / N
 
 # === Compute weights using class frequencies ===
-df["weight_c1"] = df["confidence_c1"] * (df["c1"] * (1. - w_c1) + (1 - df["c1"]) * w_c1)
-df["weight_c2"] = df["confidence_c2"] * (df["c2"] * (1. - w_c2) + (1 - df["c2"]) * w_c2)
-df["weight_c3"] = df["confidence_c3"] * (df["c3"] * (1. - w_c3) + (1 - df["c3"]) * w_c3)
+df["weight_c1"] = 1#df["confidence_c1"] * (df["c1"] * (1. - w_c1) + (1 - df["c1"]) * w_c1)
+df["weight_c2"] = 1#df["confidence_c2"] * (df["c2"] * (1. - w_c2) + (1 - df["c2"]) * w_c2)
+df["weight_c3"] = 1#df["confidence_c3"] * (df["c3"] * (1. - w_c3) + (1 - df["c3"]) * w_c3)
 
 # === Select and reorder columns ===
 output_df = df[[
@@ -59,7 +59,7 @@ output_df = df[[
 ]]
 
 # === Save the final CSV ===
-output_path = "analysis/mlc_data_no_interpolation.csv"
+output_path = "analysis/mlc_data_no_weights.csv"
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 output_df.to_csv(output_path, index=False)
 

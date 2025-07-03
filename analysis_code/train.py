@@ -95,7 +95,7 @@ def getSegmentationLoaders(batch_size, h, w):
     train_indices = total_indices[val_size:]
 
     # Create two dataset instances with different augment flags
-    train_dataset_full = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=False)
+    train_dataset_full = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=True)
     val_dataset_full = CocoSegmentationDataset(coco_annotation_path, image_root_dir, h, w, augment=False)
 
     # Subset them using the precomputed indices
@@ -179,8 +179,8 @@ def getMLCLoaders(batch_size, h, w):
     train_indices = total_indices[val_size:]
 
     # Create two dataset instances with different augment flags
-    train_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=False)
-    val_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=True)
+    train_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=True)
+    val_dataset_full = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=False)
 
     # Subset them using the precomputed indices
     train_dataset = Subset(train_dataset_full, train_indices)
@@ -328,7 +328,7 @@ def validateMLCStep(model, dataloader, criterion, device):
 
             all_probs.append(probs.cpu())
             all_preds.append((probs > 0.5).cpu())
-            all_labels.append(labels.cpu())
+            all_labels.append((labels > 0.5).cpu())
 
     avg_loss = total_loss / len(dataloader)
 
@@ -425,17 +425,17 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
         seg_train_loss = trainSegmentationStep(model, seg_train_loader, seg_criterion, optimizer, device)
         print(f"Epoch {epoch+1}/{num_epochs}, Segmentation Train Loss: {seg_train_loss:.4f}")
         seg_val_loss = validateSegmentationStep(model, seg_val_loader, seg_criterion, device)
-        print(f"Segmentation Validation Loss: {seg_val_loss / len(seg_val_loader):.4f}")
+        print(f"Segmentation Validation Loss: {seg_val_loss:.4f}")
 
         mlc_train_loss = trainMLCStep(model, mlc_train_loader, mlc_criterion, optimizer, device)
         print(f"CVS Classification Train Loss: {mlc_train_loss:.4f}")
         mlc_val_loss, val_f1, val_ap = validateMLCStep(model, mlc_val_loader, mlc_criterion, device)
-        print(f"CVS Classification Loss: {mlc_val_loss:.4f}, F1: {val_f1:.4f}")
+        print(f"CVS Classification Validation Loss: {mlc_val_loss:.4f}, F1: {val_f1:.4f}")
         for i, ap in enumerate(val_ap):
-            print(f"Average Precision for class {i}: {ap:.4f}")
+            print(f"Average Precision for c{i+1}: {ap:.4f}")
 
 def main():
-    seg_batch_size, mlc_batch_size = 4, 8
+    seg_batch_size, mlc_batch_size = 20, 40
     h, w = 300, 300
     train_seg_loader, val_seg_loader = getSegmentationLoaders(seg_batch_size, h, w)
     train_mlc_loader, val_mlc_loader = getMLCLoaders(mlc_batch_size, h, w)
@@ -444,15 +444,15 @@ def main():
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EfficientNetMultiHead(num_labels=num_labels, num_classes=num_classes).to(device)
-    num_epochs = 10
-    unfreeze_epoch = 2
+    num_epochs = 50
+    unfreeze_epoch = 5
     optimizer = torch.optim.AdamW([
         {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
         {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
         {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
     ])
     train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loader, val_seg_loader, train_mlc_loader, val_mlc_loader)
-    logSegmentationResults(log_dir, seg_val_loader, model, device)
+    logSegmentationResults('segmentation_results', seg_val_loader, model, device)
 
 if __name__ == "__main__":
     main()
