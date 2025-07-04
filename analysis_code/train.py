@@ -159,8 +159,11 @@ class EfficientNetMultiHead(nn.Module):
         base = models.efficientnet_b3(pretrained=True)
 
         # Remove the last 3 MBConv blocks
-        cutoff_layer, num_backbone_features = 3, 136
-        self.features = nn.Sequential(*list(base.features.children())[:-cutoff_layer])
+        seg_cutoff_layer, seg_num_backbone_features = 3, 136
+        mlc_cutoff_layer, mlc_num_backbone_features = 1, 384
+        assert seg_cutoff_layer >= mlc_cutoff_layer
+        self.seg_features = nn.Sequential(*list(base.features.children())[:-seg_cutoff_layer])
+        self.features = nn.Sequential(*list(base.features.children())[:-mlc_cutoff_layer])
 
         # Use adaptive pooling to collapse spatial dims
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -169,7 +172,7 @@ class EfficientNetMultiHead(nn.Module):
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.3),
-            nn.Linear(num_backbone_features, 256),
+            nn.Linear(mlc_num_backbone_features, 256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, num_labels)  # Multi-label logits
@@ -177,7 +180,7 @@ class EfficientNetMultiHead(nn.Module):
 
         # --- Segmentation head ---
         self.segmentation_head = nn.Sequential(
-            nn.Conv2d(num_backbone_features, 128, kernel_size=3, padding=1),
+            nn.Conv2d(seg_num_backbone_features, 128, kernel_size=3, padding=1),
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
@@ -197,13 +200,14 @@ class EfficientNetMultiHead(nn.Module):
         )
 
     def forward(self, x, task):
-        features = self.features(x)
 
         if task == 'classification':
-            pooled = self.pool(features)
+            mlc_features = self.features(x)
+            pooled = self.pool(mlc_features)
             return self.classifier(pooled)
         elif task == 'segmentation':
-            return self.segmentation_head(features)
+            seg_features = self.seg_features(x)
+            return self.segmentation_head(seg_features)
         else:
             raise ValueError(f"Unknown task: {task}")
 
