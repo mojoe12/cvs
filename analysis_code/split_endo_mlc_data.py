@@ -19,9 +19,9 @@ df = df.rename(columns={'C1': 'c1', 'C2': 'c2', 'C3': 'c3'})
 df['image'] = df['vid'].astype(str) + '_' + df['frame'].astype(str) + '.jpg'
 
 # Add weight columns
-df['weight_c1'] = 1
-df['weight_c2'] = 1
-df['weight_c3'] = 1
+df['weight_c1'] = 1./6.
+df['weight_c2'] = 1./6.
+df['weight_c3'] = 1./6.
 
 # Split based on 'vid'
 train_df = df[df['vid'] <= 120]
