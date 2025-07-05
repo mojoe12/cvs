@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import models, transforms
 from torchvision.transforms import functional as TF
+from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score
 from torchvision.ops import FeaturePyramidNetwork
@@ -14,6 +15,24 @@ import os
 import pandas as pd
 import random
 
+def pad_to_square_height(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    if h >= w:
+        return mask  # already square or portrait
+    pad_total = w - h
+    pad_top = pad_total // 2
+    pad_bottom = pad_total - pad_top
+    return np.pad(mask, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=0)
+
+class PadToSquareHeight:
+    def __call__(self, img):
+        w, h = img.size
+        if h >= w:
+            return img  # already tall or square
+        pad = (w - h) // 2
+        padding = (0, pad, 0, w - h - pad)  # left, top, right, bottom
+        return TF.pad(img, padding, fill=0, padding_mode='constant')
+
 class CocoSegmentationDataset(Dataset):
     def __init__(self, annotation_file, root_dir, height, width, augment):
         self.coco = COCO(annotation_file)
@@ -22,6 +41,7 @@ class CocoSegmentationDataset(Dataset):
         self.h = height
         self.w = width
         self.transform = transforms.Compose([
+            PadToSquareHeight(),
             transforms.Resize((self.h, self.w)),
             transforms.ToTensor(),
         ])
@@ -51,6 +71,7 @@ class CocoSegmentationDataset(Dataset):
         for ann in anns:
             cat_id = ann["category_id"]
             mask_seg = self.coco.annToMask(ann)
+            mask_seg = pad_to_square_height(mask_seg)
             mask_resized = st.resize(
                 mask_seg,
                 (self.h, self.w),
@@ -100,6 +121,7 @@ class MultiLabelImageDataset(Dataset):
         self.h = height
         self.w = width
         self.transform = transforms.Compose([
+            PadToSquareHeight(),
             transforms.Resize((self.h, self.w)),
             transforms.ToTensor(),
         ])
@@ -156,26 +178,26 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
 class EfficientNetMultiHead(nn.Module):
     def __init__(self, num_labels, num_classes):
         super().__init__()
+
         base = models.efficientnet_b3(pretrained=True)
+        self.features = nn.Sequential(*list(base.features.children()))
 
         # Remove the last 3 MBConv blocks
-        seg_cutoff_layer, seg_num_backbone_features = 3, 136
-        mlc_cutoff_layer, mlc_num_backbone_features = 1, 384
-        assert seg_cutoff_layer >= mlc_cutoff_layer
-        self.seg_features = nn.Sequential(*list(base.features.children())[:-seg_cutoff_layer])
-        self.features = nn.Sequential(*list(base.features.children())[:-mlc_cutoff_layer])
+        self.seg_cutoff_layer = 3
+        seg_num_backbone_features = 112
+        mlc_num_backbone_features = 1280
+        mlc_num_hidden_features = 6
 
         # Use adaptive pooling to collapse spatial dims
         self.pool = nn.AdaptiveAvgPool2d(1)
-
         # Classification head
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.3),
-            nn.Linear(mlc_num_backbone_features, 256),
+            nn.Linear(mlc_num_backbone_features, mlc_num_hidden_features),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_labels)  # Multi-label logits
+            nn.Linear(mlc_num_hidden_features, num_labels)  # Multi-label logits
         )
 
         # --- Segmentation head ---
@@ -192,7 +214,7 @@ class EfficientNetMultiHead(nn.Module):
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(32, 16, kernel_size=3, padding=0),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
@@ -200,13 +222,12 @@ class EfficientNetMultiHead(nn.Module):
         )
 
     def forward(self, x, task):
-
         if task == 'classification':
             mlc_features = self.features(x)
             pooled = self.pool(mlc_features)
             return self.classifier(pooled)
         elif task == 'segmentation':
-            seg_features = self.seg_features(x)
+            seg_features = self.features[:-self.seg_cutoff_layer](x)
             return self.segmentation_head(seg_features)
         else:
             raise ValueError(f"Unknown task: {task}")
@@ -391,8 +412,8 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
                 print(f"Average Precision for c{i+1}: {ap:.4f}")
 
 def main():
-    seg_batch_size, mlc_batch_size = 20, 40
-    h, w = 300, 300
+    seg_batch_size, mlc_batch_size = 20, 20
+    h, w = 240, 240
     endo_train_seg_loader = getSegmentationLoader('endoscapes/train_seg/annotation_coco.json', 'endoscapes/train_seg', True, h, w, seg_batch_size)
     endo_val_seg_loader = getSegmentationLoader('endoscapes/val_seg/annotation_coco.json', 'endoscapes/val_seg', False, h, w, seg_batch_size)
     endo_test_seg_loader = getSegmentationLoader('endoscapes/test_seg/annotation_coco.json', 'endoscapes/test_seg', False, h, w, seg_batch_size)
@@ -408,17 +429,17 @@ def main():
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EfficientNetMultiHead(num_labels=num_labels, num_classes=num_classes).to(device)
-    num_epochs = 500
+    num_epochs = 50
     unfreeze_epoch = 5
     optimizer = torch.optim.AdamW([
-        {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
-        {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
-        {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+        {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
+        {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-9},
+        {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-9},
     ])
-    train_seg_loaders = [cvs_train_seg_loader, endo_train_seg_loader, endo_val_seg_loader, endo_test_seg_loader]
-    val_seg_loaders = [cvs_val_seg_loader]
-    train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader, endo_val_mlc_loader]
-    val_mlc_loaders = [cvs_val_mlc_loader, endo_test_mlc_loader]
+    train_seg_loaders = []
+    val_seg_loaders = []
+    train_mlc_loaders = [endo_train_mlc_loader]
+    val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
     train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders)
     logSegmentationResults('endo_segmentation_results', endo_val_seg_loader, model, device)
 
