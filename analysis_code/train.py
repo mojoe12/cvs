@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score
 from torchvision.ops import FeaturePyramidNetwork
 from pycocotools.coco import COCO
+import matplotlib.pylplot as plt
 import skimage.transform as st
 import numpy as np
 from PIL import Image
@@ -179,7 +180,7 @@ class EfficientNetMultiHead(nn.Module):
     def __init__(self, num_labels, num_classes):
         super().__init__()
 
-        base = models.efficientnet_b3(pretrained=True)
+        base = models.efficientnet_b1(pretrained=True)
         self.features = nn.Sequential(*list(base.features.children()))
 
         # Remove the last 3 MBConv blocks
@@ -431,17 +432,17 @@ def main():
     model = EfficientNetMultiHead(num_labels=num_labels, num_classes=num_classes).to(device)
     num_epochs = 50
     unfreeze_epoch = 5
-    optimizer = torch.optim.AdamW([
-        {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
-        {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-9},
-        {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-9},
-    ])
-    train_seg_loaders = []
-    val_seg_loaders = []
-    train_mlc_loaders = [endo_train_mlc_loader]
-    val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
+    optimizer = torch.optim.SGD([
+        {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
+        {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+        {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+    ], momentum=0.9, nesterov=True)
+    train_seg_loaders = [cvs_train_seg_loader, endo_train_seg_loader, endo_val_seg_loader, endo_test_seg_loader]
+    val_seg_loaders = [cvs_val_seg_loader]
+    train_mlc_loaders = []
+    val_mlc_loaders = []
     train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders)
-    logSegmentationResults('endo_segmentation_results', endo_val_seg_loader, model, device)
+    logSegmentationResults('segmentation_results', endo_val_seg_loader, model, device)
 
 if __name__ == "__main__":
     main()
