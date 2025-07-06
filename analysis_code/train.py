@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score
 from torchvision.ops import FeaturePyramidNetwork
 from pycocotools.coco import COCO
-import matplotlib.pylplot as plt
+import matplotlib.pyplot as plt
 import skimage.transform as st
 import numpy as np
 from PIL import Image
@@ -176,34 +176,60 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     )
     return loader
 
-class EfficientNetMultiHead(nn.Module):
-    def __init__(self, num_labels, num_classes):
-        super().__init__()
-
-        base = models.efficientnet_b1(pretrained=True)
-        self.features = nn.Sequential(*list(base.features.children()))
-
-        # Remove the last 3 MBConv blocks
-        self.seg_cutoff_layer = 3
-        seg_num_backbone_features = 112
-        mlc_num_backbone_features = 1280
-        mlc_num_hidden_features = 6
-
-        # Use adaptive pooling to collapse spatial dims
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(0.3),
-            nn.Linear(mlc_num_backbone_features, mlc_num_hidden_features),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(mlc_num_hidden_features, num_labels)  # Multi-label logits
+# ----------------------------
+# Attention Gate Module
+# ----------------------------
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
         )
 
-        # --- Segmentation head ---
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+# ----------------------------
+# Modified Multi-Task Model with Attention Gating
+# ----------------------------
+class EfficientNetMultiHead(nn.Module):
+    def __init__(self, num_labels, num_classes):
+        super(EfficientNetMultiHead, self).__init__()
+        base = models.efficientnet_b0(pretrained=True)
+        self.backbone = nn.Sequential(*list(base.features.children()))
+
+        self.attn_classification = AttentionGate(F_g=1280, F_l=1280, F_int=256)
+        self.attn_segmentation = AttentionGate(F_g=1280, F_l=1280, F_int=256)
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(1280, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_labels),
+        )
+
         self.segmentation_head = nn.Sequential(
-            nn.Conv2d(seg_num_backbone_features, 128, kernel_size=3, padding=1),
+            nn.Conv2d(1280, 128, kernel_size=3, padding=1),
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
@@ -211,7 +237,7 @@ class EfficientNetMultiHead(nn.Module):
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.Conv2d(64, 32, kernel_size=3, padding=0),
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
@@ -219,19 +245,27 @@ class EfficientNetMultiHead(nn.Module):
             nn.ReLU(),
 
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(16, num_classes, kernel_size=1)
-        )
+            nn.Conv2d(16, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(8, num_classes, kernel_size=1)
+         )
 
     def forward(self, x, task):
+        features = self.backbone(x)
+
         if task == 'classification':
-            mlc_features = self.features(x)
-            pooled = self.pool(mlc_features)
+            gated = self.attn_classification(features, features)
+            pooled = self.pool(gated)
             return self.classifier(pooled)
+
         elif task == 'segmentation':
-            seg_features = self.features[:-self.seg_cutoff_layer](x)
-            return self.segmentation_head(seg_features)
+            gated = self.attn_segmentation(features, features)
+            return self.segmentation_head(gated)
+
         else:
-            raise ValueError(f"Unknown task: {task}")
+            raise ValueError("Task must be either 'classification' or 'segmentation'")
 
 def trainSegmentationStep(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -317,11 +351,11 @@ def validateMLCStep(model, dataloader, criterion, device):
     return avg_loss, f1, per_class_ap
 
 def freeze_backbone(model):
-    for param in model.features.parameters():
+    for param in model.backbone.parameters():
         param.requires_grad = False
 
 def unfreeze_backbone(model):
-    for param in model.features.parameters():
+    for param in model.backbone.parameters():
         param.requires_grad = True
 
 def logSegmentationResults(log_dir, val_seg_loader, model, device):
@@ -433,7 +467,7 @@ def main():
     num_epochs = 50
     unfreeze_epoch = 5
     optimizer = torch.optim.SGD([
-        {'params': model.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
+        {'params': model.backbone.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
         {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
         {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
     ], momentum=0.9, nesterov=True)
