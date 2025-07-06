@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import models, transforms
 from torchvision.transforms import functional as TF
-from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+from torchvision.models.segmentation.deeplabv3 import DeepLabHead
+from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
 from torch.utils.data import DataLoader, Dataset, Subset
-from sklearn.metrics import f1_score, average_precision_score
+from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
 from torchvision.ops import FeaturePyramidNetwork
 from pycocotools.coco import COCO
 import matplotlib.pyplot as plt
@@ -176,96 +177,31 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     )
     return loader
 
-# ----------------------------
-# Attention Gate Module
-# ----------------------------
-class AttentionGate(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super(AttentionGate, self).__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-
-        self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-
-        self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
-
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
-
-# ----------------------------
-# Modified Multi-Task Model with Attention Gating
-# ----------------------------
 class EfficientNetMultiHead(nn.Module):
     def __init__(self, num_labels, num_classes):
-        super(EfficientNetMultiHead, self).__init__()
+        super().__init__()
+
+        self.features = deeplabv3_mobilenet_v3_large(pretrained=True)
+        #self.features.backbone = base.features #OPTIONAL
+        seg_num_backbone_features = 960
+        self.features.classifier = DeepLabHead(seg_num_backbone_features, num_classes)
         base = models.efficientnet_b0(pretrained=True)
-        self.backbone = nn.Sequential(*list(base.features.children()))
-
-        self.attn_classification = AttentionGate(F_g=1280, F_l=1280, F_int=256)
-        self.attn_segmentation = AttentionGate(F_g=1280, F_l=1280, F_int=256)
-
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
+            *list(base.features.children()),
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(1280, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_labels),
+            nn.Linear(1280, num_labels),
         )
 
-        self.segmentation_head = nn.Sequential(
-            nn.Conv2d(1280, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, padding=0),
-            nn.ReLU(),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(16, 8, kernel_size=3, padding=1),
-            nn.ReLU(),
-
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(8, num_classes, kernel_size=1)
-         )
-
     def forward(self, x, task):
-        features = self.backbone(x)
-
+        seg = self.features(x)["out"]
         if task == 'classification':
-            gated = self.attn_classification(features, features)
-            pooled = self.pool(gated)
-            return self.classifier(pooled)
-
+            #mlc_features = x * 1_iff_seg_elements1:7 are > epsilon
+            return self.classifier(mlc_features)
         elif task == 'segmentation':
-            gated = self.attn_segmentation(features, features)
-            return self.segmentation_head(gated)
-
+            return seg
         else:
-            raise ValueError("Task must be either 'classification' or 'segmentation'")
+            raise ValueError(f"Unknown task: {task}")
 
 def trainSegmentationStep(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -351,14 +287,14 @@ def validateMLCStep(model, dataloader, criterion, device):
     return avg_loss, f1, per_class_ap
 
 def freeze_backbone(model):
-    for param in model.backbone.parameters():
+    for param in model.features.backbone.parameters():
         param.requires_grad = False
 
 def unfreeze_backbone(model):
-    for param in model.backbone.parameters():
+    for param in model.features.backbone.parameters():
         param.requires_grad = True
 
-def logSegmentationResults(log_dir, val_seg_loader, model, device):
+def logSegmentationResults(log_dir, val_seg_loader, model, device, num_classes):
     os.makedirs(log_dir, exist_ok=True)
 
     model.eval()
@@ -413,7 +349,7 @@ def logSegmentationResults(log_dir, val_seg_loader, model, device):
     plt.savefig(f"{log_dir}/confusion_matrix.png")
     plt.close()
 
-def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders):
+def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     mlc_criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
     seg_criterion = torch.nn.CrossEntropyLoss()
@@ -421,11 +357,17 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
     if unfreeze_epoch > 0:
         freeze_backbone(model)
 
+    optimizer = optimizer_adamw
+
     # ---- Training Loop ----
     for epoch in range(num_epochs):
         if epoch == unfreeze_epoch:
             unfreeze_backbone(model)
             print("Unfroze the backbone")
+
+        if epoch == sgd_epoch:
+            optimizer = optimizer_sgd
+            print("Switched to SGD optimizer")
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_seg_loader in enumerate(train_seg_loaders):
@@ -447,8 +389,8 @@ def train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device
                 print(f"Average Precision for c{i+1}: {ap:.4f}")
 
 def main():
-    seg_batch_size, mlc_batch_size = 20, 20
-    h, w = 240, 240
+    seg_batch_size, mlc_batch_size = 32, 32
+    h, w = 224, 224
     endo_train_seg_loader = getSegmentationLoader('endoscapes/train_seg/annotation_coco.json', 'endoscapes/train_seg', True, h, w, seg_batch_size)
     endo_val_seg_loader = getSegmentationLoader('endoscapes/val_seg/annotation_coco.json', 'endoscapes/val_seg', False, h, w, seg_batch_size)
     endo_test_seg_loader = getSegmentationLoader('endoscapes/test_seg/annotation_coco.json', 'endoscapes/test_seg', False, h, w, seg_batch_size)
@@ -465,18 +407,29 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EfficientNetMultiHead(num_labels=num_labels, num_classes=num_classes).to(device)
     num_epochs = 50
-    unfreeze_epoch = 5
-    optimizer = torch.optim.SGD([
-        {'params': model.backbone.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
-        {'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
-        {'params': model.segmentation_head.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+    unfreeze_epoch = 10
+    sgd_epoch = 20
+
+    # Define AdamW optimizer (for first 20 epochs)
+    optimizer_adamw = torch.optim.AdamW([
+        {'params': model.features.backbone.parameters(), 'lr': 1e-5, 'weight_decay': 1e-4},
+        #{'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+        {'params': model.features.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+    ])
+
+    # Define SGD optimizer (to be used after 20 epochs)
+    optimizer_sgd = torch.optim.SGD([
+        {'params': model.features.backbone.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
+        #{'params': model.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
+        {'params': model.features.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-9},
     ], momentum=0.9, nesterov=True)
+
     train_seg_loaders = [cvs_train_seg_loader, endo_train_seg_loader, endo_val_seg_loader, endo_test_seg_loader]
     val_seg_loaders = [cvs_val_seg_loader]
     train_mlc_loaders = []
     val_mlc_loaders = []
-    train_loop(num_epochs, model, optimizer, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders)
-    logSegmentationResults('segmentation_results', endo_val_seg_loader, model, device)
+    train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, unfreeze_epoch, device, train_seg_loaders, val_seg_loaders, train_mlc_loaders, val_mlc_loaders)
+    logSegmentationResults('cvs_segmentation_results', cvs_val_seg_loader, model, device, num_classes)
 
 if __name__ == "__main__":
     main()
