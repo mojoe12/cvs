@@ -7,7 +7,6 @@ from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
-from torchvision.ops import FeaturePyramidNetwork
 from pycocotools.coco import COCO
 import matplotlib.pyplot as plt
 import skimage.transform as st
@@ -34,6 +33,19 @@ class PadToSquareHeight:
         pad = (w - h) // 2
         padding = (0, pad, 0, w - h - pad)  # left, top, right, bottom
         return TF.pad(img, padding, fill=0, padding_mode='constant')
+
+def compute_iou(pred_mask, true_mask, num_classes):
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred_mask == cls)
+        true_cls = (true_mask == cls)
+        intersection = (pred_cls & true_cls).sum().item()
+        union = (pred_cls | true_cls).sum().item()
+        if union == 0:
+            ious.append(float('nan'))  # Will be ignored in mAP
+        else:
+            ious.append(intersection / union)
+    return ious
 
 class CocoSegmentationDataset(Dataset):
     def __init__(self, annotation_file, root_dir, height, width, augment):
@@ -219,17 +231,42 @@ def trainSegmentationStep(model, dataloader, criterion, optimizer, device):
         running_loss += loss.item()
     return running_loss / len(dataloader)
 
-def validateSegmentationStep(model, dataloader, criterion, device):
+def validateSegmentationStep(model, dataloader, criterion, device, num_classes, iou_threshold=0.5):
     model.eval()
     val_loss = 0.0
+    all_ap = [[] for _ in range(num_classes)]  # AP for each class
     with torch.no_grad():
         for images, masks in dataloader:
             images = images.to(device)
             masks = masks.to(device)
-            outputs = model(images, 'segmentation')
+            outputs = model(images, 'segmentation')  # (B, C, H, W)
             loss = criterion(outputs, masks)
             val_loss += loss.item()
-    return val_loss / len(dataloader)
+            preds = torch.argmax(outputs, dim=1)  # (B, H, W)
+
+            for pred, target in zip(preds, masks):
+                pred = pred.cpu()
+                target = target.cpu()
+
+                ious = compute_iou(pred, target, num_classes)
+                for cls in range(num_classes):
+                    iou = ious[cls]
+                    if not np.isnan(iou):
+                        all_ap[cls].append(iou >= iou_threshold)
+    # Compute AP per class
+    ap_per_class = []
+    for cls_iou_matches in all_ap:
+        if len(cls_iou_matches) == 0:
+            ap = float('nan')
+        else:
+            precision = np.mean(cls_iou_matches)
+            ap = precision  # With binary TP/FP and thresholded IoU
+        ap_per_class.append(ap)
+
+    # Filter NaNs and compute mAP
+    valid_aps = [ap for ap in ap_per_class if not np.isnan(ap)]
+    mAP = np.mean(valid_aps) if valid_aps else 0.0
+    return val_loss / len(dataloader), mAP
 
 # ==== Training ====
 def trainMLCStep(model, dataloader, criterion, optimizer, device):
@@ -381,14 +418,15 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
             print(f"Dataset {d} CVS Classification Train Loss: {train_mlc_loss:.4f}")
 
         for d, val_seg_loader in enumerate(val_seg_loaders):
-            val_seg_loss = validateSegmentationStep(model, val_seg_loader, seg_criterion, device)
-            print(f"Dataset {d} Segmentation Validation Loss: {val_seg_loss:.4f}")
+            val_seg_loss, val_mAP = validateSegmentationStep(model, val_seg_loader, seg_criterion, device, num_classes)
+            print(f"Dataset {d} Segmentation Validation Loss: {val_seg_loss:.4f}, mAP: {val_mAP:.4f}")
 
         for d, val_mlc_loader in enumerate(val_mlc_loaders):
             val_mlc_loss, val_f1, val_ap = validateMLCStep(model, val_mlc_loader, mlc_criterion, device)
-            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, F1: {val_f1:.4f}")
-            for i, ap in enumerate(val_ap):
-                print(f"Average Precision for c{i+1}: {ap:.4f}")
+            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, F1: {val_f1:.4f}, Average Precisions:", end='')
+            for ap in val_ap:
+                print(f" {ap:.4f}", end='')
+            print("")
 
 def main():
     seg_batch_size, mlc_batch_size = 32, 32
