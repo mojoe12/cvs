@@ -196,8 +196,10 @@ class EfficientNetMultiHead(nn.Module):
     def forward(self, x, task):
         seg = self.features(x)["out"]
         if task == 'classification':
-            #mlc_features = x * 1_iff_seg_elements1:7 are > epsilon
-            return self.classifier(mlc_features)
+            softmax = torch.softmax(seg, dim=1)
+            sharpness = 50
+            mask = torch.sigmoid((1 - softmax[:, 0, :, :]) * sharpness)
+            return self.classifier(x * torch.unsqueeze(mask, 1))
         elif task == 'segmentation':
             return seg
         else:
