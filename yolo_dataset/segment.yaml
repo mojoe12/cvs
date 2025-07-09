@@ -1,0 +1,15 @@
+path: ./yolo_dataset/
+train: images/train
+val: images/val
+test: images/test
+
+names:
+- cystic_plate
+- calot_triangle
+- cystic_artery
+- cystic_duct
+- gallbladder
+- tool
+nc: 6
+
+task: segment
