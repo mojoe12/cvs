@@ -68,39 +68,46 @@ class MultiLabelImageDataset(Dataset):
 
         seg = self.yolo.predict(torch.unsqueeze(image, 0), verbose=False)[0]
         masked_image = image # fallback
+
         if seg.masks is not None:
             masks = seg.masks.data.to(image.device)  # (N, H, W)
-            # Combine all masks (e.g., union over all instance masks)
-            combined_mask = masks.sum(dim=0).clamp(max=1.0)  # (H, W)
+            classes = seg.boxes.cls.to(torch.int)    # (N,) - class IDs for each mask
 
-            # Create soft mask using sigmoid to emphasize foreground
-            sharpness = 2 # these could be learned, if I find more free time
-            resistance = 0.5 # 0 to 1, 1 is sharpest quality
-            soft_mask = (resistance + 1) * torch.sigmoid(combined_mask * sharpness) - resistance  # (H, W)
-            masked_image = image * soft_mask.unsqueeze(0)  # Apply mask to all 3 channels
+            # Filter out masks with class id == 5
+            keep_indices = (classes != 5).nonzero(as_tuple=True)[0]
+            if keep_indices.numel() > 0:
+                filtered_masks = masks[keep_indices]  # (M, H, W) where M <= N
 
-            print_masked_image = True
-            if print_masked_image:
-                # Create subplots
-                fig, axes = plt.subplots(1, 3, figsize=(12, 4))  # 1 row, 3 columns
+                combined_mask = filtered_masks.sum(dim=0).clamp(max=1.0)  # (H, W)
 
-                # Convert (C, H, W) to (H, W, C)
-                axes[0].imshow(image.permute(1, 2, 0).numpy())
-                axes[0].axis('off')  # Hide axis
-                axes[0].set_title(f"Original")
+                # Create soft mask using sigmoid to emphasize foreground
+                sharpness = 2
+                resistance = 0.5
+                soft_mask = (resistance + 1) * torch.sigmoid(combined_mask * sharpness) - resistance
+                masked_image = image * soft_mask.unsqueeze(0)
 
-                im = axes[1].imshow(soft_mask.unsqueeze(0).permute(1, 2, 0).numpy())
-                axes[1].axis('off')  # Hide axis
-                axes[1].set_title(f"Mask")
-                fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+                print_masked_image = False
+                if print_masked_image:
+                    # Create subplots
+                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))  # 1 row, 3 columns
 
-                # Convert (C, H, W) to (H, W, C)
-                axes[2].imshow(masked_image.permute(1, 2, 0).numpy())
-                axes[2].axis('off')  # Hide axis
-                axes[2].set_title(f"Masked image")
+                    # Convert (C, H, W) to (H, W, C)
+                    axes[0].imshow(image.permute(1, 2, 0).numpy())
+                    axes[0].axis('off')  # Hide axis
+                    axes[0].set_title(f"Original")
 
-                plt.tight_layout()
-                plt.show()
+                    im = axes[1].imshow(soft_mask.unsqueeze(0).permute(1, 2, 0).numpy())
+                    axes[1].axis('off')  # Hide axis
+                    axes[1].set_title(f"Mask")
+                    fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    # Convert (C, H, W) to (H, W, C)
+                    axes[2].imshow(masked_image.permute(1, 2, 0).numpy())
+                    axes[2].axis('off')  # Hide axis
+                    axes[2].set_title(f"Masked image")
+
+                    plt.tight_layout()
+                    plt.show()
 
         return masked_image, label, confidence
 
