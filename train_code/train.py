@@ -38,9 +38,7 @@ class MultiLabelImageDataset(Dataset):
             transforms.ToTensor()
         ])
         self.augment = augment
-
-        # Only photometric (image-only)
-        self.image_only_transforms = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
+        self.rand_augment = transforms.RandAugment(num_ops=16, magnitude=4)
 
     def __len__(self):
         return len(self.image_filenames)
@@ -49,16 +47,9 @@ class MultiLabelImageDataset(Dataset):
         filename = self.image_filenames[idx]
         image_path = os.path.join(self.image_dir, filename)
         image = Image.open(image_path).convert('RGB')
-        image = self.transform(image)
         if self.augment:
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-            angle = random.choice([0, 90, 180, 270])
-            image = TF.rotate(image, angle)
-            # Apply image-only transforms
-            image = self.image_only_transforms(image)
+            image = self.rand_augment(image)
+        image = self.transform(image)
         label, confidence = self.data[filename]
         label = torch.tensor(label, dtype=torch.float32)
         confidence = torch.tensor(confidence, dtype=torch.float32)
@@ -108,7 +99,7 @@ def custom_collate_fn(batch):
                 soft_mask = (resistance + 1) * torch.sigmoid(combined_mask * sharpness) - resistance
                 masked_images[index] = masked_images[index] * resize_t(soft_mask.unsqueeze(0)).to('cpu')
 
-                print_masked_image = False
+                print_masked_image = True
                 if print_masked_image:
                     # Create subplots
                     fig, axes = plt.subplots(1, 3, figsize=(12, 4))  # 1 row, 3 columns
