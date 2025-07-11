@@ -35,15 +35,12 @@ class MultiLabelImageDataset(Dataset):
         self.transform = transforms.Compose([
             PadToSquareHeight(),
             transforms.Resize((self.h, self.w)),
-            transforms.ToTensor(),
+            transforms.ToTensor()
         ])
         self.augment = augment
 
         # Only photometric (image-only)
         self.image_only_transforms = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
-
-        yolo_model_path='train_code/yolo11s_cvs.pt'
-        self.yolo = YOLO(yolo_model_path)  # YOLOv8 instance segmentation model
 
     def __len__(self):
         return len(self.image_filenames)
@@ -66,13 +63,40 @@ class MultiLabelImageDataset(Dataset):
         label = torch.tensor(label, dtype=torch.float32)
         confidence = torch.tensor(confidence, dtype=torch.float32)
 
-        seg = self.yolo.predict(torch.unsqueeze(image, 0), verbose=False)[0]
-        masked_image = image # fallback
+        return image, label, confidence
 
+yolo_model_path='train_code/yolo11s_cvs.pt'
+my_yolo = YOLO(yolo_model_path)  # YOLOv8 instance segmentation model
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function for a batch of images and variable-sized targets (e.g., bounding boxes).
+
+    Args:
+        batch: A list of tuples (image, target), where:
+            - image is a Tensor of shape (C, H, W)
+            - target is a dict (e.g., with boxes, labels, masks, etc.)
+
+    Returns:
+        images: A Tensor of stacked images (if sizes match) or list if variable sizes
+        targets: A list of target dictionaries
+    """
+    images = [TF.to_pil_image(item[0]) for item in batch]
+    labels = [item[1] for item in batch]
+    confidences = [item[2] for item in batch]
+
+    sharpness = 2
+    resistance = 0.5
+    resize_t = transforms.Resize((300, 300))
+    masked_images = [0.5 * (1 - resistance) * resize_t(item[0]) for item in batch] # fallback
+
+    segs = my_yolo.predict(images, verbose=False)
+
+    for index, seg in enumerate(segs):
         if seg.masks is not None:
-            masks = seg.masks.data.to(image.device)  # (N, H, W)
+            image = images[index]
+            masks = seg.masks.data  # (N, H, W)
             classes = seg.boxes.cls.to(torch.int)    # (N,) - class IDs for each mask
-
             # Filter out masks with class id == 5
             keep_indices = (classes != 5).nonzero(as_tuple=True)[0]
             if keep_indices.numel() > 0:
@@ -81,10 +105,8 @@ class MultiLabelImageDataset(Dataset):
                 combined_mask = filtered_masks.sum(dim=0).clamp(max=1.0)  # (H, W)
 
                 # Create soft mask using sigmoid to emphasize foreground
-                sharpness = 2
-                resistance = 0.5
                 soft_mask = (resistance + 1) * torch.sigmoid(combined_mask * sharpness) - resistance
-                masked_image = image * soft_mask.unsqueeze(0)
+                masked_images[index] = masked_images[index] * resize_t(soft_mask.unsqueeze(0)).to('cpu')
 
                 print_masked_image = False
                 if print_masked_image:
@@ -92,7 +114,7 @@ class MultiLabelImageDataset(Dataset):
                     fig, axes = plt.subplots(1, 3, figsize=(12, 4))  # 1 row, 3 columns
 
                     # Convert (C, H, W) to (H, W, C)
-                    axes[0].imshow(image.permute(1, 2, 0).numpy())
+                    axes[0].imshow(image)
                     axes[0].axis('off')  # Hide axis
                     axes[0].set_title(f"Original")
 
@@ -102,16 +124,16 @@ class MultiLabelImageDataset(Dataset):
                     fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
 
                     # Convert (C, H, W) to (H, W, C)
-                    axes[2].imshow(masked_image.permute(1, 2, 0).numpy())
+                    axes[2].imshow(masked_images[index].permute(1, 2, 0).numpy())
                     axes[2].axis('off')  # Hide axis
                     axes[2].set_title(f"Masked image")
 
                     plt.tight_layout()
                     plt.show()
 
-        return masked_image, label, confidence
+    return torch.stack(masked_images, dim=0), torch.stack(labels, dim=0), torch.stack(confidences, dim=0)
 
-def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
+def getMLCLoader(csv_file, image_path, augment, h, w, batch_size, use_yolo):
     # Transforms
     my_df = pd.read_csv(csv_file)
 
@@ -128,15 +150,16 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=4,
+        collate_fn=custom_collate_fn if use_yolo else None
     )
     return loader
 
 class MLCModel(nn.Module):
     def __init__(self, num_labels):
         super().__init__()
-        self.base = models.efficientnet_b0(pretrained=True)
+        self.base = models.efficientnet_b3(pretrained=True)
         in_features = self.base.classifier[1].in_features
         self.base.classifier = nn.Sequential(
             nn.Dropout(p=0.2, inplace=True),
@@ -243,13 +266,17 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
             print("")
 
 def main():
-    mlc_batch_size = 32 if torch.cuda.is_available() else 1
-    h, w = 640, 640
-    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size)
-    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size)
-    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size)
-    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size)
-    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size)
+    use_yolo = False
+    mlc_batch_size = 8 if torch.cuda.is_available() else 1
+    if use_yolo:
+        h, w = 640, 640
+    else:
+        h, w = 300, 300
+    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size, use_yolo)
+    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size, use_yolo)
+    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size, use_yolo)
+    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size, use_yolo)
+    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size, use_yolo)
 
     num_labels = 3
     num_classes = 7
@@ -271,9 +298,11 @@ def main():
         {'params': model.base.classifier.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4},
     ], momentum=0.9, nesterov=True)
 
-    train_mlc_loaders = [cvs_train_mlc_loader]
-    val_mlc_loaders = [cvs_val_mlc_loader]
+    train_mlc_loaders = [endo_train_mlc_loader]
+    val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
     train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, unfreeze_epoch, device, train_mlc_loaders, val_mlc_loaders)
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()
