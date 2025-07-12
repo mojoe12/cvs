@@ -57,79 +57,7 @@ class MultiLabelImageDataset(Dataset):
 
         return image, label, confidence
 
-class CustomCollateFn:
-    def __init__(self, model_path, print_masked_image, sharpness, resistance, h, w):
-        self.yolo = YOLO(model_path)
-        self.print_masked_image = print_masked_image
-        self.sharpness = sharpness
-        self.resistance = resistance
-        self.h = h
-        self.w = w
-
-    def __call__(self, batch):
-
-        """
-        Custom collate function for a batch of images and variable-sized targets (e.g., bounding boxes).
-
-        Args:
-            batch: A list of tuples (image, target), where:
-                - image is a Tensor of shape (C, H, W)
-                - target is a dict (e.g., with boxes, labels, masks, etc.)
-
-        Returns:
-            images: A Tensor of stacked images (if sizes match) or list if variable sizes
-            targets: A list of target dictionaries
-        """
-        images = [TF.to_pil_image(item[0]) for item in batch]
-        labels = [item[1] for item in batch]
-        confidences = [item[2] for item in batch]
-
-        resize_t = transforms.Resize((self.h, self.w))
-        masked_images = [0.5 * (1 - self.resistance) * resize_t(item[0]) for item in batch] # fallback
-
-        segs = self.yolo.predict(images, verbose=False)
-
-        for index, seg in enumerate(segs):
-            if seg.masks is not None:
-                image = images[index]
-                masks = seg.masks.data  # (N, H, W)
-                classes = seg.boxes.cls.to(torch.int)    # (N,) - class IDs for each mask
-                # Filter out masks with class id == 5
-                keep_indices = (classes != 5).nonzero(as_tuple=True)[0]
-                if keep_indices.numel() > 0:
-                    filtered_masks = masks[keep_indices]  # (M, H, W) where M <= N
-
-                    combined_mask = filtered_masks.sum(dim=0).clamp(max=1.0)  # (H, W)
-
-                    # Create soft mask using sigmoid to emphasize foreground
-                    soft_mask = (self.resistance + 1) * torch.sigmoid(combined_mask * self.sharpness) - resistance
-                    masked_images[index] = masked_images[index] * resize_t(soft_mask.unsqueeze(0)).to('cpu')
-
-                    if self.print_masked_image:
-                        # Create subplots
-                        fig, axes = plt.subplots(1, 3, figsize=(12, 4))  # 1 row, 3 columns
-
-                        # Convert (C, H, W) to (H, W, C)
-                        axes[0].imshow(image)
-                        axes[0].axis('off')  # Hide axis
-                        axes[0].set_title(f"Original")
-
-                        im = axes[1].imshow(soft_mask.unsqueeze(0).permute(1, 2, 0).numpy())
-                        axes[1].axis('off')  # Hide axis
-                        axes[1].set_title(f"Mask")
-                        fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-
-                        # Convert (C, H, W) to (H, W, C)
-                        axes[2].imshow(masked_images[index].permute(1, 2, 0).numpy())
-                        axes[2].axis('off')  # Hide axis
-                        axes[2].set_title(f"Masked image")
-
-                        plt.tight_layout()
-                        plt.show()
-
-        return torch.stack(masked_images, dim=0), torch.stack(labels, dim=0), torch.stack(confidences, dim=0)
-
-def getMLCLoader(csv_file, image_path, augment, h, w, batch_size, collate_fn):
+def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     # Transforms
     my_df = pd.read_csv(csv_file)
 
@@ -147,13 +75,12 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size, collate_fn):
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        collate_fn=collate_fn
+        num_workers=4
     )
     return loader
 
 class YOLOBackbone(nn.Module):
-    def __init__(self, model_spec, cutoff=10):
+    def __init__(self, model_spec, cutoff):
         super().__init__()
         yolo = YOLO(model_spec)
         # Extract raw backbone layers (excluding heads)
@@ -161,6 +88,7 @@ class YOLOBackbone(nn.Module):
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
+            #print(i, type(layer), getattr(layer, 'name', None))
             x = layer(x)
         return x
 
@@ -168,57 +96,21 @@ class MLCModel(nn.Module):
     def __init__(self, num_labels, model_type, model_spec):
         super().__init__()
         self.model_type = model_type
-        if self.model_type == "efficientnet":
-            if model_spec == "b3":
-                self.base = models.efficientnet_b3(pretrained=True)
-            else:
-                fail #invalid model_spec
-            in_features = self.base.classifier[1].in_features
-            self.base.classifier = nn.Sequential(
-                nn.Dropout(p=0.2, inplace=True),
-                nn.Linear(in_features, num_labels)
-            )
-        elif self.model_type == "resnet":
-            if model_spec == "50":
-                self.base = models.resnet50(pretrained=True)
-            elif model_spec == "18":
-                self.base = models.resnet18(pretrained=True)
-            else:
-                fail #invalid model_spec
-            in_features = self.base.fc.in_features
-            self.base.fc = nn.Linear(in_features, num_labels)
-        elif self.model_type == "yolo":
-            self.base = YOLOBackbone(model_spec)
-            num_out_features = 512
-            self.classifier = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-                nn.Linear(num_out_features, num_labels)
-            )
-        else:
-            fail # invalid model type
+        self.base = YOLOBackbone(model_spec, 11)
+        num_out_features = 512 # this might be different based on model_type. not sure yet!
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(num_out_features, num_labels)
+        )
 
     def forward(self, x):
-        if self.model_type == "yolo":
-            x = self.base(x)
-            return self.classifier(x)
-        else:
-            return self.base(x)
+        feats = self.base(x)
+        return self.classifier(feats)
 
     def set_backbone(self, requires_grad):
-        if self.model_type == "efficientnet":
-            for param in self.base.features.parameters():
-                param.requires_grad = requires_grad
-        elif self.model_type == "resnet":
-            for param in self.base.parameters():
-                param.requires_grad = requires_grad
-            for param in self.base.fc.parameters():
-                param.requires_grad = True
-        elif self.model_type == "yolo":
-            for param in self.base.parameters():
-                param.requires_grad = True
-        else:
-            fail # invalid self.model_type
+        for param in self.base.parameters():
+            param.requires_grad = True
 
 
 # ==== Training ====
@@ -311,54 +203,42 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
             print("")
 
 def main():
-    yolo_intermediate = False
-    yolo_model_path = 'train_code/yolo11s_cvs.pt'
-    model_type = "yolo"
-    model_spec = yolo_model_path
+    model_type = "11s"
+    model_spec = "train_code/yolo11s_cvs.pt"
+    #model_spec = "train_code/yolo11m_cvs_endo.pt"
+    num_epochs = 20
+    unfreeze_epoch = 10
+    sgd_epoch = 20
     mlc_batch_size = 32 if torch.cuda.is_available() else 1
-    if model_type == "yolo":
-        h, w = 640, 640
-    elif model_type == "efficientnet":
-        if model_spec == "b3":
-            h, w = 300, 300
-        else:
-            fail #invalid model_spec
-    elif model_type == "resnet":
-        h, w = 224, 224
-    else:
-        fail #invalid model_type
+    h, w = 640, 640
+    base_adam_lr = 1e-5
+    classifier_adam_lr = 1e-5
+    base_sgd_lr = 1e-5
+    classifier_sgd_lr = 1e-5
+    base_weight_decay = 0
+    classifier_weight_decay = 0
 
-    collate_fn = None
-    if yolo_intermediate:
-        sharpness = 2
-        resistance = 0.5
-        collate_fn = CustomCollateFn(yolo_model_path, print_masked_image, sharpness, resistance, h, w)
-        h, w = 640, 640
-    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size, collate_fn)
-    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size, collate_fn)
-    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size, collate_fn)
-    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size, collate_fn)
-    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size, collate_fn)
+    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size)
+    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size)
+    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size)
+    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size)
+    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size)
 
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MLCModel(num_labels=num_labels, model_type=model_type, model_spec=model_spec).to(device)
-    num_epochs = 20
-    unfreeze_epoch = 10
-    sgd_epoch = 20
 
     # Define AdamW optimizer (for first 20 epochs)
     optimizer_adamw = torch.optim.AdamW([
-        #{'params': model.base.features.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
-        {'params': model.base.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
+        {'params': model.base.parameters(), 'lr': base_adam_lr, 'weight_decay': base_weight_decay},
+        {'params': model.classifier.parameters(), 'lr': classifier_adam_lr, 'weight_decay': classifier_weight_decay},
     ])
 
     # Define SGD optimizer (to be used after 20 epochs)
     optimizer_sgd = torch.optim.SGD([
-        {'params': model.base.parameters(), 'lr': 1e-5, 'weight_decay': 1e-9},
-        #{'params': model.base.features.parameters(), 'lr': 1e-4, 'weight_decay': 1e-5},
-        #{'params': model.base.classifier.parameters(), 'lr': 1e-3, 'weight_decay': 1e-4},
+        {'params': model.base.parameters(), 'lr': base_sgd_lr, 'weight_decay': base_weight_decay},
+        {'params': model.classifier.parameters(), 'lr': classifier_sgd_lr, 'weight_decay': classifier_weight_decay},
     ], momentum=0.9, nesterov=True)
 
     train_mlc_loaders = [cvs_train_mlc_loader]
