@@ -15,6 +15,7 @@ from PIL import Image
 import os
 import pandas as pd
 import random
+import argparse
 
 class PadToSquareHeight:
     def __call__(self, img):
@@ -31,11 +32,9 @@ class MultiLabelImageDataset(Dataset):
         self.image_dir = image_dir
         self.data = labels_and_confidences
         self.image_filenames = list(labels_and_confidences.keys())
-        self.h = height
-        self.w = width
         self.transform = transforms.Compose([
             PadToSquareHeight(),
-            transforms.Resize((self.h, self.w)),
+            transforms.Resize((height, width)),
             transforms.ToTensor()
         ])
         self.augment = augment
@@ -83,7 +82,6 @@ class YOLOBackbone(nn.Module):
     def __init__(self, model_spec, cutoff):
         super().__init__()
         yolo = YOLO(model_spec)
-        # Extract raw backbone layers (excluding heads)
         self.layers = nn.ModuleList(list(yolo.model.model)[:cutoff])
 
     def forward(self, x):
@@ -93,16 +91,27 @@ class YOLOBackbone(nn.Module):
         return x
 
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_type, model_spec):
+    def __init__(self, num_labels, model_spec, num_hidden_layers, hidden_dim):
         super().__init__()
-        self.model_type = model_type
         self.base = YOLOBackbone(model_spec, 11)
         num_out_features = 512 # this might be different based on model_type. not sure yet!
-        self.classifier = nn.Sequential(
+
+        # Classifier: start with pooling and flatten
+        layers = [
             nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(num_out_features, num_labels)
-        )
+            nn.Flatten()
+        ]
+
+        # Add variable number of hidden layers
+        input_dim = num_out_features
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            input_dim = hidden_dim
+
+        # Final output layer
+        layers.append(nn.Linear(input_dim, num_labels))
+        self.classifier = nn.Sequential(*layers)
 
     def forward(self, x):
         feats = self.base(x)
@@ -202,50 +211,75 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
                 print(f" {ap:.4f}", end='')
             print("")
 
-def main():
-    model_type = "11s"
-    model_spec = "train_code/yolo11s_cvs.pt"
-    #model_spec = "train_code/yolo11m_cvs_endo.pt"
-    num_epochs = 20
-    unfreeze_epoch = 10
-    sgd_epoch = 20
-    mlc_batch_size = 32 if torch.cuda.is_available() else 1
-    h, w = 640, 640
-    base_adam_lr = 1e-5
-    classifier_adam_lr = 1e-5
-    base_sgd_lr = 1e-5
-    classifier_sgd_lr = 1e-5
-    base_weight_decay = 0
-    classifier_weight_decay = 0
 
-    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, h, w, mlc_batch_size)
-    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, h, w, mlc_batch_size)
-    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, h, w, mlc_batch_size)
-    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, h, w, mlc_batch_size)
-    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, h, w, mlc_batch_size)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Training configuration")
+
+    parser.add_argument('--model_spec', type=str, default="train_code/yolo11s_cvs.pt", help='Path to model specification')
+    parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
+    parser.add_argument('--unfreeze_epoch', type=int, default=10, help='Epoch at hwich to unfreeze layers')
+    parser.add_argument('--sgd_epoch', type=int, default=20, help='Epoch at which to switch to SGD')
+
+    parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
+                        help='Batch size for multi-label classification')
+
+    parser.add_argument('--base_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
+    parser.add_argument('--classifier_adam_lr', type=float, default=1e-5, help='Classifier Adam learning rate')
+    parser.add_argument('--base_sgd_lr', type=float, default=1e-5, help='Base SGD learning rate')
+    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-5, help='Classifier SGD learning rate')
+
+    parser.add_argument('--base_weight_decay', type=float, default=0, help='Base weight decay')
+    parser.add_argument('--classifier_weight_decay', type=float, default=0, help='Classifier weight decay')
+
+    parser.add_argument('--num_hidden_layers', type=int, default=0, help='Number of hidden layers in classifier')
+    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden layer dimensionality')
+
+    parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
+
+    return parser.parse_args()
+
+def main():
+
+    args = parse_args()
+    height, width = 640, 640 # yolo specific
+    print(f"Model spec: {args.model_spec}")
+    print(f"Epochs: {args.num_epochs}, Unfreeze at: {args.unfreeze_epoch}, SGD at: {args.sgd_epoch}")
+    print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
+    print(f"Learning rates: Adam (base={args.base_adam_lr}, clf={args.classifier_adam_lr}), "
+          f"SGD (base={args.base_sgd_lr}, clf={args.classifier_sgd_lr})")
+    print(f"Weight decay: base={args.base_weight_decay}, clf={args.classifier_weight_decay}")
+    if args.use_endoscapes:
+        print("Using endoscapes cvs 201 for additional training data")
+
+    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, height, width, args.mlc_batch_size)
+    endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, height, width, args.mlc_batch_size)
+    endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, height, width, args.mlc_batch_size)
+    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
+    cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels=num_labels, model_type=model_type, model_spec=model_spec).to(device)
+    model = MLCModel(num_labels=num_labels, model_spec=args.model_spec, num_hidden_layers=args.num_hidden_layers, hidden_dim=args.hidden_dim).to(device)
 
     # Define AdamW optimizer (for first 20 epochs)
     optimizer_adamw = torch.optim.AdamW([
-        {'params': model.base.parameters(), 'lr': base_adam_lr, 'weight_decay': base_weight_decay},
-        {'params': model.classifier.parameters(), 'lr': classifier_adam_lr, 'weight_decay': classifier_weight_decay},
+        {'params': model.base.parameters(), 'lr': args.base_adam_lr, 'weight_decay': args.base_weight_decay},
+        {'params': model.classifier.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
     ])
 
     # Define SGD optimizer (to be used after 20 epochs)
     optimizer_sgd = torch.optim.SGD([
-        {'params': model.base.parameters(), 'lr': base_sgd_lr, 'weight_decay': base_weight_decay},
-        {'params': model.classifier.parameters(), 'lr': classifier_sgd_lr, 'weight_decay': classifier_weight_decay},
+        {'params': model.base.parameters(), 'lr': args.base_sgd_lr, 'weight_decay': args.base_weight_decay},
+        {'params': model.classifier.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
     ], momentum=0.9, nesterov=True)
 
-    train_mlc_loaders = [cvs_train_mlc_loader]
+    if args.use_endoscapes:
+        train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader, endo_val_mlc_loader, endo_test_mlc_loader]
+    else:
+        train_mlc_loaders = [cvs_train_mlc_loader]
     val_mlc_loaders = [cvs_val_mlc_loader]
-    train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, unfreeze_epoch, device, train_mlc_loaders, val_mlc_loaders)
+    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, num_classes, args.unfreeze_epoch, device, train_mlc_loaders, val_mlc_loaders)
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
     main()
