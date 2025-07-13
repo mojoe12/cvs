@@ -16,6 +16,7 @@ import os
 import pandas as pd
 import random
 import argparse
+import copy
 
 class PadToSquareHeight:
     def __call__(self, img):
@@ -79,10 +80,9 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     return loader
 
 class YOLOBackbone(nn.Module):
-    def __init__(self, model_spec, cutoff):
+    def __init__(self, model):
         super().__init__()
-        yolo = YOLO(model_spec)
-        self.layers = nn.ModuleList(list(yolo.model.model)[:cutoff])
+        self.layers = nn.ModuleList(list(model.model.model)[:])
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
@@ -90,37 +90,34 @@ class YOLOBackbone(nn.Module):
             x = layer(x)
         return x
 
+def _ensure_tensor(out):
+    return out[1] if isinstance(out, tuple) else out
+
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_spec, num_hidden_layers, hidden_dim):
+    def __init__(self, num_labels, model_spec, shared_backbone):
         super().__init__()
-        self.base = YOLOBackbone(model_spec, 11)
-        num_out_features = 512 # this might be different based on model_type. not sure yet!
+        yolo = YOLO("yolo11s-cls").load(model_spec)
+        yolo.reshape_outputs(yolo.model, nc=1)
 
-        # Classifier: start with pooling and flatten
-        layers = [
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten()
-        ]
+        # Deep copy 3 separate branches
+        c1 = copy.deepcopy(yolo.model)
+        c2 = copy.deepcopy(yolo.model)
+        c3 = copy.deepcopy(yolo.model)
 
-        # Add variable number of hidden layers
-        input_dim = num_out_features
-        for _ in range(num_hidden_layers):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            input_dim = hidden_dim
-
-        # Final output layer
-        layers.append(nn.Linear(input_dim, num_labels))
-        self.classifier = nn.Sequential(*layers)
+        # Optional: add Sigmoid for multilabel probability output
+        self.c1 = nn.Sequential(c1.model[:])
+        self.c2 = nn.Sequential(c2.model[:])
+        self.c3 = nn.Sequential(c3.model[:])
 
     def forward(self, x):
-        feats = self.base(x)
-        return self.classifier(feats)
+        out1 = _ensure_tensor(self.c1(x))
+        out2 = _ensure_tensor(self.c2(x))
+        out3 = _ensure_tensor(self.c3(x))
+
+        return torch.cat([out1, out2, out3], dim=1)
 
     def set_backbone(self, requires_grad):
-        for param in self.base.parameters():
-            param.requires_grad = True
-
+        return None
 
 # ==== Training ====
 def trainMLCStep(model, dataloader, criterion, optimizer, device):
@@ -223,16 +220,15 @@ def parse_args():
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
 
-    parser.add_argument('--base_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
-    parser.add_argument('--classifier_adam_lr', type=float, default=1e-5, help='Classifier Adam learning rate')
-    parser.add_argument('--base_sgd_lr', type=float, default=1e-5, help='Base SGD learning rate')
-    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-5, help='Classifier SGD learning rate')
+    parser.add_argument('--base_adam_lr', type=float, default=1e-4, help='Base Adam learning rate')
+    parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
+    parser.add_argument('--base_sgd_lr', type=float, default=1e-4, help='Base SGD learning rate')
+    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-3, help='Classifier SGD learning rate')
 
-    parser.add_argument('--base_weight_decay', type=float, default=0, help='Base weight decay')
-    parser.add_argument('--classifier_weight_decay', type=float, default=0, help='Classifier weight decay')
+    parser.add_argument('--base_weight_decay', type=float, default=5e-4, help='Base weight decay')
+    parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
-    parser.add_argument('--num_hidden_layers', type=int, default=0, help='Number of hidden layers in classifier')
-    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden layer dimensionality')
+    parser.add_argument('--shared_backbone', action='store_true', help='Share same backbone weights for c1, c2, c3')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
 
@@ -242,7 +238,7 @@ def main():
 
     args = parse_args()
     height, width = 640, 640 # yolo specific
-    print(f"Model spec: {args.model_spec}")
+    print(f"Model spec: {args.model_spec} with {"shared" if args.shared_backbone else "different"} backbone")
     print(f"Epochs: {args.num_epochs}, Unfreeze at: {args.unfreeze_epoch}, SGD at: {args.sgd_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (base={args.base_adam_lr}, clf={args.classifier_adam_lr}), "
@@ -260,18 +256,16 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels=num_labels, model_spec=args.model_spec, num_hidden_layers=args.num_hidden_layers, hidden_dim=args.hidden_dim).to(device)
+    model = MLCModel(num_labels=num_labels, model_spec=args.model_spec, shared_backbone=args.shared_backbone).to(device)
 
     # Define AdamW optimizer (for first 20 epochs)
     optimizer_adamw = torch.optim.AdamW([
-        {'params': model.base.parameters(), 'lr': args.base_adam_lr, 'weight_decay': args.base_weight_decay},
-        {'params': model.classifier.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
+        {'params': model.parameters(), 'lr': args.base_adam_lr, 'weight_decay': args.base_weight_decay},
     ])
 
     # Define SGD optimizer (to be used after 20 epochs)
     optimizer_sgd = torch.optim.SGD([
-        {'params': model.base.parameters(), 'lr': args.base_sgd_lr, 'weight_decay': args.base_weight_decay},
-        {'params': model.classifier.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
+        {'params': model.parameters(), 'lr': args.base_sgd_lr, 'weight_decay': args.base_weight_decay},
     ], momentum=0.9, nesterov=True)
 
     if args.use_endoscapes:
