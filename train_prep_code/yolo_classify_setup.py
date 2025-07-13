@@ -3,7 +3,7 @@ import shutil
 import pandas as pd
 
 # Paths
-csv_paths = ['analysis_train_mlc_data.csv', 'analysis/val_mlc_data.csv']
+csv_paths = ['analysis/train_mlc_data.csv', 'analysis/val_mlc_data.csv']
 frames_dirs = ['sages_cvs_challenge_2025/frames', 'sages_cvs_challenge_2025/frames']
 output_base_dirs = ['yolo_cls_dataset/train/', 'yolo_cls_dataset/val/']
 

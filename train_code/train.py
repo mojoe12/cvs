@@ -94,22 +94,42 @@ def _ensure_tensor(out): # yolo Classify head returns (sigmoid(x), x) if not tra
     return out[1] if isinstance(out, tuple) else out
 
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_type, model_spec):
+    def __init__(self, num_labels, model_name, backbone_model):
         super().__init__()
-        yolo = YOLO(f"yolo{model_type}-cls").load(model_spec)
+        self.model_name = model_name
+        if len(backbone_model) > 0:
+            yolo = YOLO(self.model_name).load(backbone_model)
+        else:
+            yolo = YOLO(self.model_name)
         yolo.reshape_outputs(yolo.model, nc=3)
-        self.backbone = nn.Sequential(*list(yolo.model.children())[:-1])  # All layers except the last
-        self.head = list(yolo.model.children())[-1]  # Last layer only
+        self.backbone_layers = nn.ModuleList(list(yolo.model.model)[:-1])
+        #self.backbone = nn.Sequential(*list(yolo.model.children())[:-1])  # All layers except the last
+        self.head_layer = yolo.model.model[-1]  # Last layer only
 
     def forward(self, x):
-        feat = self.backbone(x)
-        return _ensure_tensor(self.head(feat))
+        for i, layer in enumerate(self.backbone_layers):
+            #print(i, type(layer), getattr(layer, 'name', None))
+            x = layer(x)
+        return _ensure_tensor(self.head_layer(x))
 
     def backbone_parameters(self):
-        return self.backbone.parameters()
+        return self.backbone_layers.parameters()
 
     def classifier_parameters(self):
-        return self.head.parameters()
+        return self.head_layer.parameters()
+
+    def export(self, output_file):
+        # Load base YOLO model
+        yolo = YOLO(self.model_name)
+
+        # Replace backbone and head
+        for i, layer in enumerate(self.backbone_layers):
+            yolo.model.model[i] = self.backbone_layers[i]
+        yolo.model.model[-1] = self.head_layer
+
+        # Save the model
+        yolo.save(output_file)
+        print(f"Model exported to: {output_file}")
 
 # ==== Training ====
 def trainMLCStep(model, dataloader, criterion, optimizer, device):
@@ -168,7 +188,6 @@ def validateMLCStep(model, dataloader, criterion, device):
 
     return avg_loss, f1, per_class_ap
 
-
 def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     mlc_criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
@@ -197,8 +216,8 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
-    parser.add_argument('--model_type', type=str, default="11s", help='Path to model specification')
-    parser.add_argument('--model_spec', type=str, default="train_code/yolo11s_cvs.pt", help='Path to model specification')
+    parser.add_argument('--model_name', type=str, required=True, help='Path to model specification')
+    parser.add_argument('--backbone_model', type=str, default="", help='Path to model specification')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=20, help='Epoch at which to switch to SGD')
 
@@ -207,13 +226,15 @@ def parse_args():
 
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-4, help='Base Adam learning rate')
     parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
-    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-4, help='Base SGD learning rate')
-    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-3, help='Classifier SGD learning rate')
+    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-3, help='Base SGD learning rate')
+    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-2, help='Classifier SGD learning rate')
 
     parser.add_argument('--backbone_weight_decay', type=float, default=5e-4, help='Base weight decay')
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
+
+    parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
 
     return parser.parse_args()
 
@@ -221,8 +242,9 @@ def main():
 
     args = parse_args()
     height, width = 640, 640 # yolo specific
-    assert args.model_type in args.model_spec # i.e. 11s for yolo11s-cvs.pt
-    print(f"Model spec: {args.model_spec}")
+    print(f"Model name: {args.model_name}")
+    if len(args.backbone_model) > 0:
+        print(f"Loading backbone weights from model: {args.backbone_model}")
     print(f"Epochs: {args.num_epochs}, switch to SGD at: {args.sgd_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr}), "
@@ -230,6 +252,7 @@ def main():
     print(f"Weight decay: backbone={args.backbone_weight_decay}, clf={args.classifier_weight_decay}")
     if args.use_endoscapes:
         print("Using endoscapes cvs 201 for additional training data")
+    print(f"Logging to {args.output_file}")
 
     endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, height, width, args.mlc_batch_size)
     endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, height, width, args.mlc_batch_size)
@@ -240,7 +263,7 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels=num_labels, model_type=args.model_type, model_spec=args.model_spec).to(device)
+    model = MLCModel(num_labels=num_labels, model_name=args.model_name, backbone_model=args.backbone_model).to(device)
 
     # Define AdamW optimizer (for first 20 epochs)
     optimizer_adamw = torch.optim.AdamW([
@@ -260,6 +283,8 @@ def main():
         train_mlc_loaders = [cvs_train_mlc_loader]
     val_mlc_loaders = [cvs_val_mlc_loader]
     train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders)
+    if len(args.output_file) > 0:
+        model.export(args.output_file)
 
 if __name__ == "__main__":
     main()
