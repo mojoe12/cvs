@@ -111,10 +111,6 @@ class MLCModel(nn.Module):
     def classifier_parameters(self):
         return self.head.parameters()
 
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
 # ==== Training ====
 def trainMLCStep(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -173,21 +169,14 @@ def validateMLCStep(model, dataloader, criterion, device):
     return avg_loss, f1, per_class_ap
 
 
-def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, unfreeze_epoch, device, train_mlc_loaders, val_mlc_loaders):
+def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     mlc_criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
-
-    if unfreeze_epoch > 0:
-        model.set_backbone(requires_grad=False)
 
     optimizer = optimizer_adamw
 
     # ---- Training Loop ----
     for epoch in range(num_epochs):
-        if epoch == unfreeze_epoch and unfreeze_epoch > 0:
-            model.set_backbone(requires_grad=True)
-            print("Unfroze the backbone")
-
         if epoch == sgd_epoch:
             optimizer = optimizer_sgd
             print("Switched to SGD optimizer")
@@ -211,7 +200,6 @@ def parse_args():
     parser.add_argument('--model_type', type=str, default="11s", help='Path to model specification')
     parser.add_argument('--model_spec', type=str, default="train_code/yolo11s_cvs.pt", help='Path to model specification')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
-    parser.add_argument('--unfreeze_epoch', type=int, default=10, help='Epoch at hwich to unfreeze layers')
     parser.add_argument('--sgd_epoch', type=int, default=20, help='Epoch at which to switch to SGD')
 
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
@@ -235,7 +223,7 @@ def main():
     height, width = 640, 640 # yolo specific
     assert args.model_type in args.model_spec # i.e. 11s for yolo11s-cvs.pt
     print(f"Model spec: {args.model_spec}")
-    print(f"Epochs: {args.num_epochs}, Unfreeze at: {args.unfreeze_epoch}, SGD at: {args.sgd_epoch}")
+    print(f"Epochs: {args.num_epochs}, switch to SGD at: {args.sgd_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr}), "
           f"SGD (backbone={args.backbone_sgd_lr}, clf={args.classifier_sgd_lr})")
@@ -271,7 +259,7 @@ def main():
     else:
         train_mlc_loaders = [cvs_train_mlc_loader]
     val_mlc_loaders = [cvs_val_mlc_loader]
-    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, num_classes, args.unfreeze_epoch, device, train_mlc_loaders, val_mlc_loaders)
+    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders)
 
 if __name__ == "__main__":
     main()
