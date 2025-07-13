@@ -90,63 +90,26 @@ class YOLOBackbone(nn.Module):
             x = layer(x)
         return x
 
-def _ensure_tensor(out):
+def _ensure_tensor(out): # yolo Classify head returns (sigmoid(x), x) if not training
     return out[1] if isinstance(out, tuple) else out
 
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_type, model_spec, shared_backbone):
+    def __init__(self, num_labels, model_type, model_spec):
         super().__init__()
         yolo = YOLO(f"yolo{model_type}-cls").load(model_spec)
-        yolo.reshape_outputs(yolo.model, nc=1)
-
-               # Split the model into backbone and head
-        backbone = nn.Sequential(*list(yolo.model.children())[:-1])  # All layers except the last
-        head = list(yolo.model.children())[-1]  # Last layer only
-
-        if shared_backbone:
-            # Share the same backbone among all three branches
-            self.backbone = backbone
-            self.head1 = copy.deepcopy(head)
-            self.head2 = copy.deepcopy(head)
-            self.head3 = copy.deepcopy(head)
-        else:
-            # Create separate backbones and heads
-            self.backbone1 = copy.deepcopy(backbone)
-            self.head1 = copy.deepcopy(head)
-
-            self.backbone2 = copy.deepcopy(backbone)
-            self.head2 = copy.deepcopy(head)
-
-            self.backbone3 = copy.deepcopy(backbone)
-            self.head3 = copy.deepcopy(head)
-
-        self.shared_backbone = shared_backbone
+        yolo.reshape_outputs(yolo.model, nc=3)
+        self.backbone = nn.Sequential(*list(yolo.model.children())[:-1])  # All layers except the last
+        self.head = list(yolo.model.children())[-1]  # Last layer only
 
     def forward(self, x):
-        if self.shared_backbone:
-            feat = self.backbone(x)
-            out1 = _ensure_tensor(self.head1(feat))
-            out2 = _ensure_tensor(self.head2(feat))
-            out3 = _ensure_tensor(self.head3(feat))
-        else:
-            out1 = _ensure_tensor(self.head1(self.backbone1(x)))
-            out2 = _ensure_tensor(self.head2(self.backbone2(x)))
-            out3 = _ensure_tensor(self.head3(self.backbone3(x)))
-
-        return torch.cat([out1, out2, out3], dim=1)
+        feat = self.backbone(x)
+        return _ensure_tensor(self.head(feat))
 
     def backbone_parameters(self):
-        if self.shared_backbone:
-            return self.backbone.parameters()
-        else:
-            return list(self.backbone1.parameters()) + \
-                   list(self.backbone2.parameters()) + \
-                   list(self.backbone3.parameters())
+        return self.backbone.parameters()
 
     def classifier_parameters(self):
-        return list(self.head1.parameters()) + \
-               list(self.head2.parameters()) + \
-               list(self.head3.parameters())
+        return self.head.parameters()
 
     def set_backbone(self, requires_grad):
         for param in self.backbone_parameters():
@@ -262,8 +225,6 @@ def parse_args():
     parser.add_argument('--backbone_weight_decay', type=float, default=5e-4, help='Base weight decay')
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
-    parser.add_argument('--shared_backbone', action='store_true', help='Share same backbone weights for c1, c2, c3')
-
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
 
     return parser.parse_args()
@@ -272,9 +233,8 @@ def main():
 
     args = parse_args()
     height, width = 640, 640 # yolo specific
-    backbone_shared_string = "shared" if args.shared_backbone else "different"
     assert args.model_type in args.model_spec # i.e. 11s for yolo11s-cvs.pt
-    print(f"Model spec: {args.model_spec} with {backbone_shared_string} backbone")
+    print(f"Model spec: {args.model_spec}")
     print(f"Epochs: {args.num_epochs}, Unfreeze at: {args.unfreeze_epoch}, SGD at: {args.sgd_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr}), "
@@ -292,7 +252,7 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels=num_labels, model_type=args.model_type, model_spec=args.model_spec, shared_backbone=args.shared_backbone).to(device)
+    model = MLCModel(num_labels=num_labels, model_type=args.model_type, model_spec=args.model_spec).to(device)
 
     # Define AdamW optimizer (for first 20 epochs)
     optimizer_adamw = torch.optim.AdamW([
