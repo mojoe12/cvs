@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Load the CSV file
-df = pd.read_csv('image_class_counts_cvs.csv')
+df = pd.read_csv('analysis/image_class_counts_cvs.csv')
 
 # Ensure the columns are boolean or convert them if necessary
 # This assumes that the relevant columns are either already 0/1 or True/False
