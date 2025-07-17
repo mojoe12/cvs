@@ -261,7 +261,7 @@ def validateMLCStep(model, dataloader, criterion, device):
 
     return avg_loss, f1, per_class_ap
 
-def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders):
+def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
 
@@ -272,6 +272,9 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, num
         if epoch == sgd_epoch:
             optimizer = optimizer_sgd
             print("Switched to SGD optimizer")
+
+        if epoch == unfreeze_epoch:
+            model.set_backbone(True)
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_mlc_loader in enumerate(train_mlc_loaders):
@@ -292,6 +295,7 @@ def parse_args():
     parser.add_argument('--model_name', type=str, required=True, help='Path to MLC model specification')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
+    parser.add_argument('--unfreeze_epoch', type=int, default=-1, help='Epoch at which to unfreeze the backbone')
 
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
@@ -305,6 +309,7 @@ def parse_args():
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
+    parser.add_argument('--use_interpolated_cvs', action='store_true', help='Add in interpolated samples from CVS')
 
     parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
 
@@ -320,6 +325,8 @@ def main():
     print(f"Num epochs: {args.num_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
+    if args.unfreeze_epoch >= 0:
+        print(f"Unfreeze backbone at: {args.unfreeze_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr})")
     if args.sgd_epoch >= 0:
@@ -327,24 +334,25 @@ def main():
     print(f"Weight decay: backbone={args.backbone_weight_decay}, clf={args.classifier_weight_decay}")
     if args.use_endoscapes:
         print("Using endoscapes cvs 201 for additional training data")
-
+    if args.use_interpolated_cvs:
+        print("Using interpolated data from CVS")
     if args.use_yolo12:
         print("Using YOLO 12 structure")
- 
     if len(args.output_file) > 0:
         print(f"Logging to {args.output_file}")
 
     endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, height, width, args.mlc_batch_size)
     endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, height, width, args.mlc_batch_size)
     endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, height, width, args.mlc_batch_size)
-    cvs_train_mlc_loader = getMLCLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
+    train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated_cvs else 'analysis/train_mlc_data.csv'
+    cvs_train_mlc_loader = getMLCLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
     cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
-    model.set_backbone(False) # TODO return to unfreeze_epoch logic
+    model.set_backbone(False)
     #TODO update adamw and sgd logic to have gradually decreasing LR
 
     optimizer_adamw = torch.optim.AdamW([
@@ -363,7 +371,7 @@ def main():
         train_mlc_loaders = [cvs_train_mlc_loader]
     val_mlc_loaders = [cvs_val_mlc_loader]
 
-    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders)
+    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders)
     if len(args.output_file) > 0:
         model.export(args.output_file)
 
