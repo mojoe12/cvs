@@ -78,37 +78,102 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     )
     return loader
 
-def _ensure_tensor(out): # yolo Classify head returns (sigmoid(x), x) if not training
-    return out[1] if isinstance(out, tuple) else out
+class MultiScaleHead(nn.Module):
+    """
+    A head layer that takes three feature maps of different spatial resolutions
+    (HxW = 40x40, 80x80, 160x160), performs adaptive pooling, concatenates them,
+    and outputs multilabel classification logits for `num_labels` labels.
+    """
+    def __init__(self, in_channels, num_labels=3, pool_output_size=1, hidden_dim=128):
+        """
+        Args:
+            in_channels (list or tuple of int): Number of channels for each input feature map,
+                                             e.g. [C1, C2, C3].
+            num_labels (int): Number of multilabel classification outputs.
+            pool_output_size (int): Spatial size after adaptive pooling (default 1 for GAP).
+            hidden_dim (int): Hidden dimension size for the intermediate fully-connected layer.
+        """
+        super(MultiScaleHead, self).__init__()
+        assert len(in_channels) == 3, "Expect three input scales"
+        C1, C2, C3 = in_channels
+
+        # Adaptive pooling to a fixed spatial size
+        self.pool1 = nn.AdaptiveAvgPool2d(pool_output_size)
+        self.pool2 = nn.AdaptiveAvgPool2d(pool_output_size)
+        self.pool3 = nn.AdaptiveAvgPool2d(pool_output_size)
+
+        # Fully connected layers
+        total_channels = C1 + C2 + C3
+        self.fc1 = nn.Linear(total_channels * pool_output_size * pool_output_size, hidden_dim)
+        self.act = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden_dim, num_labels)
+
+    def forward(self, inputs):
+        """
+        Args:
+            inputs (tuple of torch.Tensor): (x1, x2, x3) feature maps from
+                three scales with shapes:
+                x1: [N, C1, 40, 40]
+                x2: [N, C2, 80, 80]
+                x3: [N, C3, 160, 160]
+
+        Returns:
+            logits: [N, num_labels]
+        """
+        x1, x2, x3 = inputs
+        # Adaptive pooling to (N, C, pool_output_size, pool_output_size)
+        p1 = self.pool1(x1)
+        p2 = self.pool2(x2)
+        p3 = self.pool3(x3)
+
+        # Flatten each to (N, C*pool_output_size*pool_output_size)
+        f1 = torch.flatten(p1, start_dim=1)
+        f2 = torch.flatten(p2, start_dim=1)
+        f3 = torch.flatten(p3, start_dim=1)
+
+        # Concatenate features
+        fused = torch.cat([f1, f2, f3], dim=1)
+
+        # Classification head
+        hidden = self.act(self.fc1(fused))
+        logits = self.fc2(hidden)
+        return logits
 
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_name, backbone_model, simple_linear):
+    def __init__(self, num_labels, model_name):
         super().__init__()
         self.model_name = model_name
         yolo = YOLO(self.model_name)
-        yolo.reshape_outputs(yolo.model, nc=num_labels)
-        if len(backbone_model) > 0:
-            yolo = yolo.load(backbone_model)
-        self.backbone_layers = nn.ModuleList(list(yolo.model.model)[:-1])
-        #self.backbone = nn.Sequential(*list(yolo.model.children())[:-1])  # All layers except the last
-        if simple_linear:
-            num_out_features = 512
-            self.head_layer = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-                nn.Linear(num_out_features, num_labels)
-            )
-        else:
-            self.head_layer = yolo.model.model[-1]
+        self.backbone_layers = nn.ModuleList([
+            yolo.model.model[index] for index in range(len(yolo.model.model) - 1)
+        ])
+        self.concat_map = { #this has been constructed manually for yolo 11
+            12: [-1, 6],  # layer 10 will receive concatenated outputs of layers 9 and 6
+            15: [-1, 4],
+            18: [-1, 13],
+            21: [-1, 10],
+            23: [16, 19, -1],
+        }
+        self.head_layer = MultiScaleHead((128, 256, 512), num_labels)
 
     def forward(self, x):
-        for i, layer in enumerate(self.backbone_layers):
-            #print(i, type(layer), getattr(layer, 'name', None))
-            x = layer(x)
-        return _ensure_tensor(self.head_layer(x))
+        outputs = []
+        current = x
+
+        for idx, layer in enumerate(self.backbone_layers):
+            if idx in self.concat_map:
+                current = tuple(outputs[i] for i in self.concat_map[idx])
+                current = layer(current)
+            else:
+                current = layer(current)
+            outputs.append(current)
+        idx = len(self.backbone_layers)
+        if idx in self.concat_map:
+            current = tuple(outputs[i] for i in self.concat_map[idx])
+        return self.head_layer(current) 
 
     def backbone_parameters(self):
-        return self.backbone_layers.parameters()
+        return [p for layer in self.backbone_layers for p in layer.parameters()]
 
     def classifier_parameters(self):
         return self.head_layer.parameters()
@@ -118,9 +183,8 @@ class MLCModel(nn.Module):
         yolo = YOLO(self.model_name)
 
         # Replace backbone and head
-        for i, layer in enumerate(self.backbone_layers):
-            yolo.model.model[i] = self.backbone_layers[i]
-        yolo.model.model[-1] = self.head_layer
+        for i, layer in enumerate(self.layers):
+            yolo.model.model[i] = self.layers[i]
 
         # Save the model
         yolo.save(output_file)
@@ -212,17 +276,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
     parser.add_argument('--model_name', type=str, required=True, help='Path to MLC model specification')
-    parser.add_argument('--backbone_model', type=str, default="", help='Path to backbone mode')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
 
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
 
-    parser.add_argument('--backbone_adam_lr', type=float, default=1e-4, help='Base Adam learning rate')
-    parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
-    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-3, help='Base SGD learning rate')
-    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-2, help='Classifier SGD learning rate')
+    parser.add_argument('--backbone_adam_lr', type=float, default=1e-3, help='Base Adam learning rate')
+    parser.add_argument('--classifier_adam_lr', type=float, default=1e-2, help='Classifier Adam learning rate')
+    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-4, help='Base SGD learning rate')
+    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-3, help='Classifier SGD learning rate')
 
     parser.add_argument('--backbone_weight_decay', type=float, default=5e-4, help='Base weight decay')
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
@@ -240,8 +303,6 @@ def main():
     args = parse_args()
     height, width = 640, 640 # yolo specific
     print(f"MLC Model name: {args.model_name}")
-    if len(args.backbone_model) > 0:
-        print(f"Preloading model weights with backbone model: {args.backbone_model}")
     print(f"Num epochs: {args.num_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
@@ -268,7 +329,7 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels, args.model_name, args.backbone_model, args.simple_linear).to(device)
+    model = MLCModel(num_labels, args.model_name).to(device)
 
     optimizer_adamw = torch.optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
