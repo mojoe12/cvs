@@ -140,21 +140,31 @@ class MultiScaleHead(nn.Module):
         return logits
 
 class MLCModel(nn.Module):
-    def __init__(self, num_labels, model_name):
+    def __init__(self, num_labels, model_name, use_y12):
         super().__init__()
         self.model_name = model_name
         yolo = YOLO(self.model_name)
         self.backbone_layers = nn.ModuleList([
             yolo.model.model[index] for index in range(len(yolo.model.model) - 1)
         ])
-        self.concat_map = { #this has been constructed manually for yolo 11
-            12: [-1, 6],  # layer 10 will receive concatenated outputs of layers 9 and 6
-            15: [-1, 4],
-            18: [-1, 13],
-            21: [-1, 10],
-            23: [16, 19, -1],
-        }
-        self.head_layer = MultiScaleHead((128, 256, 512), num_labels)
+        if use_y12:
+            self.concat_map = {
+                10: [-1, 6],
+                13: [-1, 4],
+                16: [-1, 11],
+                19: [-1, 8],
+                21: [14, 17, -1],
+            }
+            self.head_layer = MultiScaleHead((256, 512, 512), num_labels)
+        else:
+            self.concat_map = { #this has been constructed manually for yolo 11
+                12: [-1, 6],  # layer 10 will receive concatenated outputs of layers 9 and 6
+                15: [-1, 4],
+                18: [-1, 13],
+                21: [-1, 10],
+                23: [16, 19, -1],
+            }
+            self.head_layer = MultiScaleHead((128, 256, 512), num_labels)
 
     def forward(self, x):
         outputs = []
@@ -177,6 +187,10 @@ class MLCModel(nn.Module):
 
     def classifier_parameters(self):
         return self.head_layer.parameters()
+
+    def set_backbone(self, requires_grad):
+        for param in self.backbone_parameters():
+            param.requires_grad = requires_grad
 
     def export(self, output_file):
         # Load base YOLO model
@@ -284,15 +298,15 @@ def parse_args():
 
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-3, help='Base Adam learning rate')
     parser.add_argument('--classifier_adam_lr', type=float, default=1e-2, help='Classifier Adam learning rate')
-    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-4, help='Base SGD learning rate')
-    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-3, help='Classifier SGD learning rate')
+    parser.add_argument('--backbone_sgd_lr', type=float, default=1e-3, help='Base SGD learning rate')
+    parser.add_argument('--classifier_sgd_lr', type=float, default=1e-2, help='Classifier SGD learning rate')
 
     parser.add_argument('--backbone_weight_decay', type=float, default=5e-4, help='Base weight decay')
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
 
-    parser.add_argument('--simple_linear', action='store_true', help='Replace final classifier head with simple linear classifier')
+    parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
 
     parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
 
@@ -314,8 +328,8 @@ def main():
     if args.use_endoscapes:
         print("Using endoscapes cvs 201 for additional training data")
 
-    if args.simple_linear:
-        print("Replacing final classifier head with simple linear classifier")
+    if args.use_yolo12:
+        print("Using YOLO 12 structure")
  
     if len(args.output_file) > 0:
         print(f"Logging to {args.output_file}")
@@ -329,7 +343,9 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels, args.model_name).to(device)
+    model = MLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
+    model.set_backbone(False) # TODO return to unfreeze_epoch logic
+    #TODO update adamw and sgd logic to have gradually decreasing LR
 
     optimizer_adamw = torch.optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
