@@ -1,0 +1,20 @@
+path: ./seg_yolo_labels/
+train: images/train
+val: images/val
+- images/endo_val
+- images/endo_test
+
+names:
+ 0: cystic_plate_c3_one
+ 1: cystic_plate_c3_zero
+ 2: calot_triangle_c2_one
+ 3: calot_triangle_c2_zero
+ 4: cystic_artery_c1_one
+ 5: cystic_artery_c1_zero
+ 6: cystic_duct_c1_one
+ 7: cystic_duct_c1_zero
+ 8: gallbladder_c3_one
+ 9: gallbladder_c3_zero
+ 10: tool
+
+task: segment
