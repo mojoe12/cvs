@@ -10,17 +10,12 @@ import pandas as pd
 model = YOLO("train_code/yolo11s_cvs.pt")  # Replace with your trained YOLOv8 segmentation model
 
 # Directory paths
-img_dir = "sages_cvs_challenge_2025/frames"
-output_dir = "seg_yolo_labels/labels/val"
-csv_file = "analysis/val_mlc_data.csv" #CHANGE TO TRAIN
-os.makedirs(output_dir, exist_ok=True)
-
-# Metadata: maps image name to [c1, c2, c3]
-my_df = pd.read_csv(csv_file)
-image_info = {
-    row['image']: [row['c1'], row['c2'], row['c3']]
-    for _, row in my_df.iterrows()
-}
+assignments = []
+assignments.append(("sages_cvs_challenge_2025/frames", "analysis/train_mlc_data_interpolated.csv", "seg_yolo_labels/labels/train"))
+assignments.append(("sages_cvs_challenge_2025/frames", "analysis/val_mlc_data.csv", "seg_yolo_labels/labels/val"))
+assignments.append(("endoscapes/train", "analysis/endo_train_mlc_data.csv", "seg_yolo_labels/labels/endo_train"))
+assignments.append(("endoscapes/val", "analysis/endo_val_mlc_data.csv", "seg_yolo_labels/labels/endo_val"))
+assignments.append(("endoscapes/test", "analysis/endo_test_mlc_data.csv", "seg_yolo_labels/labels/endo_test"))
 
 # Define class name to index mapping
 original_classes = {
@@ -65,39 +60,48 @@ def remap_class(class_name, c1, c2, c3):
         return None  # Skip anything unexpected
 
 # Process each image
-for img_path in glob(os.path.join(img_dir, "*.jpg")):
-    img_name = os.path.basename(img_path)
-    if img_name not in image_info:
-        continue
+for img_dir, csv_file, output_dir in assignments:
+    os.makedirs(output_dir, exist_ok=True)
 
-    c1, c2, c3 = image_info[img_name]
-    img = cv2.imread(img_path)
-    h, w = img.shape[:2]
-
-    results = model(img_path, verbose=False)[0]
-
-    txt_path = os.path.join(output_dir, img_name.replace(".jpg", ".txt"))
-    with open(txt_path, "w") as f:
-        if results.masks is None:
+    # Metadata: maps image name to [c1, c2, c3]
+    my_df = pd.read_csv(csv_file)
+    image_info = {
+        row['image']: [row['c1'], row['c2'], row['c3']]
+        for _, row in my_df.iterrows()
+    }
+    for img_path in glob(os.path.join(img_dir, "*.jpg")):
+        img_name = os.path.basename(img_path)
+        if img_name not in image_info:
             continue
 
-        for cls_id, box, mask in zip(results.boxes.cls.cpu().numpy().astype(int),
-                                     results.boxes.xywhn.cpu().numpy(),
-                                     results.masks.xy):
-            class_name = original_classes[cls_id]
-            new_class_id = remap_class(class_name, c1, c2, c3)
-            if new_class_id is None:
+        c1, c2, c3 = image_info[img_name]
+        img = cv2.imread(img_path)
+        h, w = img.shape[:2]
+
+        results = model(img_path, verbose=False)[0]
+
+        txt_path = os.path.join(output_dir, img_name.replace(".jpg", ".txt"))
+        with open(txt_path, "w") as f:
+            if results.masks is None:
                 continue
 
-            x_center, y_center, width, height = box  # normalized
+            for cls_id, box, mask in zip(results.boxes.cls.cpu().numpy().astype(int),
+                                         results.boxes.xywhn.cpu().numpy(),
+                                         results.masks.xy):
+                class_name = original_classes[cls_id]
+                new_class_id = remap_class(class_name, c1, c2, c3)
+                if new_class_id is None:
+                    continue
 
-            # Normalize polygon coordinates
-            poly_coords = []
-            for point in mask:  # each point is [x, y] in absolute coords
-                norm_x = point[0] / w
-                norm_y = point[1] / h
-                poly_coords.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
+                x_center, y_center, width, height = box  # normalized
 
-            line = f"{new_class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} " + " ".join(poly_coords) + "\n"
-            f.write(line)
+                # Normalize polygon coordinates
+                poly_coords = []
+                for point in mask:  # each point is [x, y] in absolute coords
+                    norm_x = point[0] / w
+                    norm_y = point[1] / h
+                    poly_coords.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
+
+                line = f"{new_class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} " + " ".join(poly_coords) + "\n"
+                f.write(line)
 
