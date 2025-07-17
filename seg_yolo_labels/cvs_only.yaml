@@ -11,7 +11,8 @@ names:
  5: cystic_artery_c1_zero
  6: cystic_duct_c1_one
  7: cystic_duct_c1_zero
- 8: gallbladder
- 9: tool
+ 8: gallbladder_c3_one
+ 9: gallbladder_c3_zero
+ 10: tool
 
 task: segment

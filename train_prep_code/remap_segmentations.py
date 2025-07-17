@@ -11,8 +11,8 @@ model = YOLO("train_code/yolo11s_cvs.pt")  # Replace with your trained YOLOv8 se
 
 # Directory paths
 img_dir = "sages_cvs_challenge_2025/frames"
-output_dir = "seg_yolo_labels/labels/train"
-csv_file = "analysis/train_mlc_data.csv" #CHANGE TO TRAIN
+output_dir = "seg_yolo_labels/labels/val"
+csv_file = "analysis/val_mlc_data.csv" #CHANGE TO TRAIN
 os.makedirs(output_dir, exist_ok=True)
 
 # Metadata: maps image name to [c1, c2, c3]
@@ -32,7 +32,7 @@ original_classes = {
     5: "tool"
 }
 
-# New class mapping (10 classes)
+# New class mapping (11 classes)
 new_class_map = {
     ("cystic_plate", 1): 0,
     ("cystic_plate", 0): 1,
@@ -42,8 +42,9 @@ new_class_map = {
     ("cystic_artery", 0): 5,
     ("cystic_duct", 1): 6,
     ("cystic_duct", 0): 7,
-    ("gallbladder", None): 8,
-    ("tool", None): 9
+    ("gallbladder", 1): 8,
+    ("gallbladder", 0): 9,
+    ("tool", None): 10
 }
 
 # Helper to remap classes
@@ -56,7 +57,9 @@ def remap_class(class_name, c1, c2, c3):
         return new_class_map[(class_name, round(c1))]
     elif class_name == "cystic_duct":
         return new_class_map[(class_name, round(c1))]
-    elif class_name in ["gallbladder", "tool"]:
+    elif class_name == "gallbladder":
+        return new_class_map[(class_name, round(c3))]
+    elif class_name == "tool":
         return new_class_map[(class_name, None)]
     else:
         return None  # Skip anything unexpected
