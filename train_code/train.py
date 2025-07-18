@@ -3,11 +3,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import models, transforms
 from torchvision.transforms import functional as TF
+import torch.nn.functional as F
 from ultralytics import YOLO
 #from ultralytics.nn.modules.block import Concat, Detect, C2f, C3, Conv  # etc.
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
 from pycocotools.coco import COCO
+from torchmetrics import AveragePrecision
 import matplotlib.pyplot as plt
 import skimage.transform as st
 import numpy as np
@@ -57,7 +59,7 @@ class MultiLabelImageDataset(Dataset):
             angle = random.choice([0, 90, 180, 270])
             image = TF.rotate(image, angle)
             # Apply image-only transforms
-            image = self.image_only_transforms(image)
+            #image = self.image_only_transforms(image)
             #image = self.rand_augment(image)
         image = self.transform(image)
         label, confidence = self.data[filename]
@@ -97,8 +99,6 @@ class MultiScaleHead(nn.Module):
         super(MultiScaleHead, self).__init__()
 
         self.cv3 = detect.cv3
-        self.cv3.parameters()
-
         self.conv1 = nn.Sequential(
             nn.MaxPool2d(kernel_size=2, stride=2),  # 80x80 -> 40x40
             nn.Conv2d(11, 128, kernel_size=3, padding=1),  # 80x80 -> 40x40
@@ -140,6 +140,54 @@ class MultiScaleHead(nn.Module):
         conv_all = torch.cat((conv1, conv2, conv3), dim=1)
         return self.conv_final(conv_all)
 
+class MultiLabelCNN(nn.Module):
+    def __init__(self, detect, num_labels, num_inputs):
+        super(MultiLabelCNN, self).__init__()
+
+        self.cv3 = detect.cv3
+        # Conv Layers
+        self.conv1 = nn.Conv2d(33, 32, kernel_size=3, padding=1)   # -> (32, 80, 80)
+        self.pool1 = nn.MaxPool2d(2, 2)                            # -> (32, 40, 40)
+
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)   # -> (64, 40, 40)
+        self.pool2 = nn.MaxPool2d(2, 2)                            # -> (64, 20, 20)
+
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)  # -> (128, 20, 20)
+        self.pool3 = nn.MaxPool2d(2, 2)                            # -> (128, 10, 10)
+
+        # FC layers (reduced size)
+        self.fc1 = nn.Linear(128 * 10 * 10, 256)                   # much smaller
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(256, num_labels)
+
+    def forward(self, inputs):
+        x1, x2, x3 = inputs
+        conv1 = self.cv3[0](x1)
+        conv2 = self.cv3[1](x2)
+        conv3 = self.cv3[2](x3)
+        conv2_upscale = F.interpolate(conv2, scale_factor=2, mode='nearest')
+        conv3_upscale = F.interpolate(conv3, scale_factor=4, mode='nearest')
+        x = torch.cat((conv1, conv2_upscale, conv3_upscale), dim=1)
+
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+
+        x = F.relu(self.conv3(x))
+        x = self.pool3(x)
+
+        x = x.view(x.size(0), -1)  # flatten
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
+
+# Example usage:
+# model = MultiLabelCNN(num_classes=10)
+# output = model(torch.randn(8, 33, 80, 80))  # batch of 8
+# print(output.shape)  # -> torch.Size([8, 10])
+
 class MLCModel(nn.Module):
     def __init__(self, num_labels, model_name, use_y12):
         super().__init__()
@@ -164,7 +212,7 @@ class MLCModel(nn.Module):
                 21: [-1, 10],
                 23: [16, 19, -1],
             }
-        self.head_layer = MultiScaleHead(yolo.model.model[-1], num_labels)
+        self.head_layer = MultiLabelCNN(yolo.model.model[-1], num_labels, 11 * 3)
 
     def forward(self, x):
         outputs = []
@@ -223,11 +271,10 @@ def trainStep(model, dataloader, criterion, optimizer, device):
         total_loss += loss.item()
     return total_loss / len(dataloader)
 
-def validateMLCStep(model, dataloader, criterion, device):
+def validateMLCStep(model, dataloader, criterion, device, precision):
     model.eval()
     total_loss = 0
 
-    all_preds = []
     all_probs = []
     all_labels = []
 
@@ -242,30 +289,18 @@ def validateMLCStep(model, dataloader, criterion, device):
             loss = (loss_raw * confidences).mean()
             total_loss += loss.item()
 
-            probs = torch.sigmoid(outputs)
-
-            all_probs.append(probs.cpu())
-            all_preds.append((probs > 0.5).cpu())
-            all_labels.append((labels > 0.5).cpu())
+            precision.update(torch.sigmoid(outputs), (labels > 0.5))
 
     avg_loss = total_loss / len(dataloader)
 
-    # Stack all batches
-    all_probs = torch.cat(all_probs).numpy()
-    all_preds = torch.cat(all_preds).numpy()
-    all_labels = torch.cat(all_labels).numpy()
+    # Compute statistics
 
-    # Compute macro F1
-    f1 = f1_score(all_labels, all_preds, average='macro')
+    return avg_loss
 
-    # Compute AP per class
-    per_class_ap = average_precision_score(all_labels, all_probs, average=None)
-
-    return avg_loss, f1, per_class_ap
-
-def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders):
+def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd, sgd_epoch, unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
+    precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
 
     optimizer = optimizer_adamw
 
@@ -278,18 +313,20 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
         if epoch == unfreeze_epoch:
             model.set_backbone(True)
 
+
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_mlc_loader in enumerate(train_mlc_loaders):
             train_loss = trainStep(model, train_mlc_loader, criterion, optimizer, device)
             print(f"Dataset {d} CVS Classification Train Loss: {train_loss:.4f}")
 
         for d, val_mlc_loader in enumerate(val_mlc_loaders):
-            val_mlc_loss, val_f1, val_ap = validateMLCStep(model, val_mlc_loader, criterion, device)
-            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, F1: {val_f1:.4f}, Average Precisions:", end='')
-            for ap in val_ap:
-                print(f" {ap:.4f}", end='')
-            print("")
+            precision.reset()
+            val_mlc_loss = validateMLCStep(model, val_mlc_loader, criterion, device, precision)
+            map_score = precision.compute()  # Tensor of size [num_classes] or scalar if average="macro"
+            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, Average Precisions: {map_score}")
 
+        if len(val_mlc_loaders) > 0 and epoch >= sgd_epoch and sgd_epoch > -1:
+            scheduler_sgd.step(val_mlc_loss)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
@@ -355,7 +392,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
     model.set_backbone(False)
-    #TODO update adamw and sgd logic to have gradually decreasing LR
 
     optimizer_adamw = torch.optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
@@ -367,13 +403,21 @@ def main():
         {'params': model.classifier_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
     ], momentum=0.9, nesterov=True)
 
+    scheduler_sgd = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_sgd,
+        mode='min',          # minimize val_loss
+        factor=0.5,          # reduce LR by this factor
+        patience=2,          # wait N epochs before reducing
+        min_lr=1e-6          # don’t reduce below this
+    )
+
     if args.use_endoscapes:
         train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader, endo_val_mlc_loader, endo_test_mlc_loader]
     else:
-        train_mlc_loaders = [cvs_train_mlc_loader]
-    val_mlc_loaders = [cvs_val_mlc_loader]
+        train_mlc_loaders = [endo_train_mlc_loader]
+    val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
 
-    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, device, train_mlc_loaders, val_mlc_loaders)
+    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders)
     if len(args.output_file) > 0:
         model.export(args.output_file)
 
