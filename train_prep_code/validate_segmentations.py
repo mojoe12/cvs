@@ -7,9 +7,9 @@ from ultralytics import YOLO
 import pandas as pd
 
 # Paths
-val_img_dir = "seg_yolo_labels/images/val"
-model_path = "train_code/new_yolo11s_cvs_pred.pt"  # Replace with your model path
-csv_file = "analysis/val_mlc_data.csv" #CHANGE TO TRAIN
+val_img_dir = "seg_yolo_labels/images/endo_val"
+model_path = "runs/detect/train6/weights/best.pt"  # Replace with your model path
+csv_file = "analysis/endo_val_mlc_data.csv" #CHANGE TO TRAIN
 
 # Your metadata dictionary with ground truth
 # Metadata: maps image name to [c1, c2, c3]
@@ -29,8 +29,9 @@ class_ids = {
     "cystic_artery_c1_zero": 5,
     "cystic_duct_c1_one": 6,
     "cystic_duct_c1_zero": 7,
-    "gallbladder": 8,
-    "tool": 9,
+    "gallbladder_c3_one": 8,
+    "gallbladder_c3_zero": 9,
+    "tool": 10,
 }
 id_to_class = {v: k for k, v in class_ids.items()}
 
@@ -53,7 +54,7 @@ for img_path in glob(os.path.join(val_img_dir, "*.jpg")):
     detected_ids = set(result.boxes.cls.cpu().numpy().astype(int)) if result.boxes else set()
     detected_classes = {id_to_class[i] for i in detected_ids}
 
-    pred_c3 = 1 if "cystic_plate_c3_one" in detected_classes else 0
+    pred_c3 = 1 if "cystic_plate_c3_one" in detected_classes or "gallbladder_c3_one" in detected_classes else 0
     pred_c2 = 1 if "calot_triangle_c2_one" in detected_classes else 0
     pred_c1 = 1 if ("cystic_artery_c1_one" in detected_classes or "cystic_duct_c1_one" in detected_classes) else 0
     #print("c1", y_true["c1"], "pred_c1", pred_c1)

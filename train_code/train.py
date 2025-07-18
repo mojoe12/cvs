@@ -39,6 +39,7 @@ class MultiLabelImageDataset(Dataset):
             transforms.ToTensor()
         ])
         self.augment = augment
+        self.image_only_transforms = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
         self.rand_augment = transforms.RandAugment(num_ops=16, magnitude=4)
 
     def __len__(self):
@@ -49,7 +50,15 @@ class MultiLabelImageDataset(Dataset):
         image_path = os.path.join(self.image_dir, filename)
         image = Image.open(image_path).convert('RGB')
         if self.augment:
-            image = self.rand_augment(image)
+            if random.random() > 0.5:
+                image = TF.hflip(image)
+            if random.random() > 0.5:
+                image = TF.vflip(image)
+            angle = random.choice([0, 90, 180, 270])
+            image = TF.rotate(image, angle)
+            # Apply image-only transforms
+            image = self.image_only_transforms(image)
+            #image = self.rand_augment(image)
         image = self.transform(image)
         label, confidence = self.data[filename]
         label = torch.tensor(label, dtype=torch.float32)
@@ -84,29 +93,33 @@ class MultiScaleHead(nn.Module):
     (HxW = 40x40, 80x80, 160x160), performs adaptive pooling, concatenates them,
     and outputs multilabel classification logits for `num_labels` labels.
     """
-    def __init__(self, in_channels, num_labels=3, pool_output_size=1, hidden_dim=128):
-        """
-        Args:
-            in_channels (list or tuple of int): Number of channels for each input feature map,
-                                             e.g. [C1, C2, C3].
-            num_labels (int): Number of multilabel classification outputs.
-            pool_output_size (int): Spatial size after adaptive pooling (default 1 for GAP).
-            hidden_dim (int): Hidden dimension size for the intermediate fully-connected layer.
-        """
+    def __init__(self, detect, num_labels=3):
         super(MultiScaleHead, self).__init__()
-        assert len(in_channels) == 3, "Expect three input scales"
-        C1, C2, C3 = in_channels
 
-        # Adaptive pooling to a fixed spatial size
-        self.pool1 = nn.AdaptiveAvgPool2d(pool_output_size)
-        self.pool2 = nn.AdaptiveAvgPool2d(pool_output_size)
-        self.pool3 = nn.AdaptiveAvgPool2d(pool_output_size)
+        self.cv3 = detect.cv3
+        self.cv3.parameters()
 
-        # Fully connected layers
-        total_channels = C1 + C2 + C3
-        self.fc1 = nn.Linear(total_channels * pool_output_size * pool_output_size, hidden_dim)
-        self.act = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(hidden_dim, num_labels)
+        self.conv1 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 80x80 -> 40x40
+            nn.Conv2d(11, 128, kernel_size=3, padding=1),  # 80x80 -> 40x40
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # 40x40 -> 20x20
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),  # 40x40 -> 20x20
+            nn.ReLU()
+        )
+        self.conv2 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 80x80 -> 40x40
+            nn.Conv2d(11, 128, kernel_size=3, padding=1),  # 40x40 -> 20x20
+            nn.ReLU()
+        )
+        self.conv_final = nn.Sequential(
+            nn.MaxPool2d(2, 2),  # 20x20 -> 10x10
+            nn.Conv2d(256 + 128 + 11, 512, kernel_size=3, stride=1, padding=1), # 20x20 -> 10x10
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),  # 10x10 -> 1x1
+            nn.Flatten(),
+            nn.Linear(512, num_labels)
+        )
 
     def forward(self, inputs):
         """
@@ -121,23 +134,11 @@ class MultiScaleHead(nn.Module):
             logits: [N, num_labels]
         """
         x1, x2, x3 = inputs
-        # Adaptive pooling to (N, C, pool_output_size, pool_output_size)
-        p1 = self.pool1(x1)
-        p2 = self.pool2(x2)
-        p3 = self.pool3(x3)
-
-        # Flatten each to (N, C*pool_output_size*pool_output_size)
-        f1 = torch.flatten(p1, start_dim=1)
-        f2 = torch.flatten(p2, start_dim=1)
-        f3 = torch.flatten(p3, start_dim=1)
-
-        # Concatenate features
-        fused = torch.cat([f1, f2, f3], dim=1)
-
-        # Classification head
-        hidden = self.act(self.fc1(fused))
-        logits = self.fc2(hidden)
-        return logits
+        conv1 = self.conv1(self.cv3[0](x1))
+        conv2 = self.conv2(self.cv3[1](x2))
+        conv3 = self.cv3[2](x3)
+        conv_all = torch.cat((conv1, conv2, conv3), dim=1)
+        return self.conv_final(conv_all)
 
 class MLCModel(nn.Module):
     def __init__(self, num_labels, model_name, use_y12):
@@ -155,7 +156,6 @@ class MLCModel(nn.Module):
                 19: [-1, 8],
                 21: [14, 17, -1],
             }
-            self.head_layer = MultiScaleHead((256, 512, 512), num_labels)
         else:
             self.concat_map = { #this has been constructed manually for yolo 11
                 12: [-1, 6],  # layer 10 will receive concatenated outputs of layers 9 and 6
@@ -164,7 +164,7 @@ class MLCModel(nn.Module):
                 21: [-1, 10],
                 23: [16, 19, -1],
             }
-            self.head_layer = MultiScaleHead((128, 256, 512), num_labels)
+        self.head_layer = MultiScaleHead(yolo.model.model[-1], num_labels)
 
     def forward(self, x):
         outputs = []
@@ -190,6 +190,8 @@ class MLCModel(nn.Module):
 
     def set_backbone(self, requires_grad):
         for param in self.backbone_parameters():
+            param.requires_grad = requires_grad
+        for param in self.head_layer.cv3.parameters():
             param.requires_grad = requires_grad
 
     def export(self, output_file):
