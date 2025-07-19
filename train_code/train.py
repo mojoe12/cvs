@@ -59,7 +59,7 @@ class MultiLabelImageDataset(Dataset):
             angle = random.choice([0, 90, 180, 270])
             image = TF.rotate(image, angle)
             # Apply image-only transforms
-            #image = self.image_only_transforms(image)
+            image = self.image_only_transforms(image)
             #image = self.rand_augment(image)
         image = self.transform(image)
         label, confidence = self.data[filename]
@@ -141,47 +141,44 @@ class MultiScaleHead(nn.Module):
         return self.conv_final(conv_all)
 
 class MultiLabelCNN(nn.Module):
-    def __init__(self, detect, num_labels, num_inputs):
+    def __init__(self, num_inputs, num_labels):
         super(MultiLabelCNN, self).__init__()
 
-        self.cv3 = detect.cv3
+        ni1, ni2, ni3 = num_inputs
+        in_channels = ni1 + ni2 + ni3
         # Conv Layers
-        self.conv1 = nn.Conv2d(33, 32, kernel_size=3, padding=1)   # -> (32, 80, 80)
-        self.pool1 = nn.MaxPool2d(2, 2)                            # -> (32, 40, 40)
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
 
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)   # -> (64, 40, 40)
-        self.pool2 = nn.MaxPool2d(2, 2)                            # -> (64, 20, 20)
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 80x80 → 40x40
 
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)  # -> (128, 20, 20)
-        self.pool3 = nn.MaxPool2d(2, 2)                            # -> (128, 10, 10)
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 40x40 → 20x20
+        )
 
-        # FC layers (reduced size)
-        self.fc1 = nn.Linear(128 * 10 * 10, 256)                   # much smaller
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(256, num_labels)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),  # 256 x 20 x 20 = 102400
+            nn.Linear(256 * 20 * 20, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_labels),
+        )
 
     def forward(self, inputs):
         x1, x2, x3 = inputs
-        conv1 = self.cv3[0](x1)
-        conv2 = self.cv3[1](x2)
-        conv3 = self.cv3[2](x3)
-        conv2_upscale = F.interpolate(conv2, scale_factor=2, mode='nearest')
-        conv3_upscale = F.interpolate(conv3, scale_factor=4, mode='nearest')
-        x = torch.cat((conv1, conv2_upscale, conv3_upscale), dim=1)
+        x2_upscale = F.interpolate(x2, scale_factor=2, mode='nearest')
+        x3_upscale = F.interpolate(x3, scale_factor=4, mode='nearest')
+        x = torch.cat((x1, x2_upscale, x3_upscale), dim=1)
 
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x)
-
-        x = F.relu(self.conv2(x))
-        x = self.pool2(x)
-
-        x = F.relu(self.conv3(x))
-        x = self.pool3(x)
-
-        x = x.view(x.size(0), -1)  # flatten
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        return self.fc2(x)
+        x = self.features(x)
+        return self.classifier(x)
 
 # Example usage:
 # model = MultiLabelCNN(num_classes=10)
@@ -193,42 +190,20 @@ class MLCModel(nn.Module):
         super().__init__()
         self.model_name = model_name
         yolo = YOLO(self.model_name)
+        self.output_indices = set([4, 6, 10])
+        self.head_layer = MultiLabelCNN((256, 256, 512), num_labels)
+        max_output_index = max(self.output_indices)
         self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(len(yolo.model.model) - 1)
+            yolo.model.model[index] for index in range(max_output_index + 1)
         ])
-        if use_y12:
-            self.concat_map = {
-                10: [-1, 6],
-                13: [-1, 4],
-                16: [-1, 11],
-                19: [-1, 8],
-                21: [14, 17, -1],
-            }
-        else:
-            self.concat_map = { #this has been constructed manually for yolo 11
-                12: [-1, 6],  # layer 10 will receive concatenated outputs of layers 9 and 6
-                15: [-1, 4],
-                18: [-1, 13],
-                21: [-1, 10],
-                23: [16, 19, -1],
-            }
-        self.head_layer = MultiLabelCNN(yolo.model.model[-1], num_labels, 11 * 3)
 
     def forward(self, x):
         outputs = []
-        current = x
-
         for idx, layer in enumerate(self.backbone_layers):
-            if idx in self.concat_map:
-                current = tuple(outputs[i] for i in self.concat_map[idx])
-                current = layer(current)
-            else:
-                current = layer(current)
-            outputs.append(current)
-        idx = len(self.backbone_layers)
-        if idx in self.concat_map:
-            current = tuple(outputs[i] for i in self.concat_map[idx])
-        return self.head_layer(current) 
+            x = layer(x)
+            if idx in self.output_indices:
+                outputs.append(x)
+        return self.head_layer(outputs)
 
     def backbone_parameters(self):
         return [p for layer in self.backbone_layers for p in layer.parameters()]
@@ -238,8 +213,6 @@ class MLCModel(nn.Module):
 
     def set_backbone(self, requires_grad):
         for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-        for param in self.head_layer.cv3.parameters():
             param.requires_grad = requires_grad
 
     def export(self, output_file):
@@ -312,6 +285,7 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd,
 
         if epoch == unfreeze_epoch:
             model.set_backbone(True)
+            print("Unfroze backbone")
 
 
         print(f"Epoch {epoch+1}/{num_epochs}")
