@@ -49,8 +49,11 @@ class MultiLabelImageDataset(Dataset):
             transforms.ToTensor()
         ])
         self.augment = augment
-        self.image_only_transforms = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05)
-        self.rand_augment = transforms.RandAugment(num_ops=16, magnitude=4)
+        self.image_only_transforms = transforms.Compose([
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+            transforms.RandAugment(num_ops=16, magnitude=4),
+        ])
+        self.random_erase = transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
 
     def __len__(self):
         return len(self.image_filenames)
@@ -68,11 +71,13 @@ class MultiLabelImageDataset(Dataset):
             image = TF.rotate(image, angle)
             # Apply image-only transforms
             image = self.image_only_transforms(image)
-            #image = self.rand_augment(image)
         image = self.transform(image)
+        if self.augment:
+            image = self.random_erase(image)
         label, confidence = self.data[filename]
         label = torch.tensor(label, dtype=torch.float32)
         confidence = torch.tensor(confidence, dtype=torch.float32)
+        confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32) # TODO decide
 
         return image, label, confidence
 
@@ -126,7 +131,7 @@ class MultiScaleHead(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),  # 10x10 -> 1x1
             nn.Flatten(),
-            nn.Linear(512, num_labels)
+            nn.Linear(512, num_labels, bias=True)
         )
 
     def forward(self, inputs):
@@ -176,7 +181,7 @@ class MultiLabelCNN(nn.Module):
             nn.Linear(256 * 20 * 20, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(512, num_labels),
+            nn.Linear(512, num_labels, bias=True),
         )
 
     def forward(self, inputs):
@@ -243,9 +248,10 @@ class TransformerModel(nn.Module):
         #tested models: 'swinv2_base_window12to24_192to384.ms_in22k_ft_in1k'
         #               'vit_base_patch16_224.mae'
         #               'mambaout_femto.in1k'
-        self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
-        feature_channels = 1152 #self.backbone.feature_info[-1]['num_chs']
-        self.head = nn.Linear(feature_channels, num_labels)
+        self.backbone = timm.create_model(model_name, pretrained=True)
+        feature_channels = self.backbone.feature_info[-1]['num_chs']
+        self.backbone.reset_classifier(0)
+        self.head = nn.Linear(feature_channels, num_labels, bias=True)
         # Replace classifier with multilabel output (3 labels)
 
     def forward(self, x):
@@ -266,18 +272,57 @@ class TransformerModel(nn.Module):
         TODO
 
 # ==== Training ====
-def trainStep(model, dataloader, criterion, optimizer, device):
+def mixup_data(x, y, alpha=1.0):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def cutmix_data(x, y, alpha=1.0):
+    '''Returns cutmixed inputs, pairs of targets, and lambda'''
+    lam = np.random.beta(alpha, alpha)
+    batch_size, _, H, W = x.size()
+    index = torch.randperm(batch_size)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    cut_w = int(W * np.sqrt(1 - lam))
+    cut_h = int(H * np.sqrt(1 - lam))
+
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+
+    x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    y_a, y_b = y, y[index]
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+    return x, y_a, y_b, lam
+
+def trainStep(model, dataloader, criterion, optimizer, device, max_norm):
     model.train()
     total_loss = 0
     for images, labels, confidences in dataloader:
         images = images.to(device)
         labels = labels.to(device)
         confidences = confidences.to(device)
+        # Apply MixUp or CutMix
+        if random.random() < 0.5:
+            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=0.4)
+        else:
+            images, targets_a, targets_b, lam = cutmix_data(images, labels, alpha=0.4)
         optimizer.zero_grad()
         outputs = model(images)
-        loss_raw = criterion(outputs, labels)
+        loss_raw = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
         loss = (loss_raw * confidences).mean()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(dataloader)
@@ -308,11 +353,11 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
 
     return avg_loss
 
-def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd, sgd_epoch, unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders):
+def train_loop(num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sgd, scheduler_sgd, sgd_epoch, unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders):
     # ---- Optimizer and Loss ----
     criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
-
+    max_norm = 5
     optimizer = optimizer_adamw
 
     # ---- Training Loop ----
@@ -328,7 +373,7 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd,
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_mlc_loader in enumerate(train_mlc_loaders):
-            train_loss = trainStep(model, train_mlc_loader, criterion, optimizer, device)
+            train_loss = trainStep(model, train_mlc_loader, criterion, optimizer, device, max_norm)
             print(f"Dataset {d} CVS Classification Train Loss: {train_loss:.4f}")
 
         for d, val_mlc_loader in enumerate(val_mlc_loaders):
@@ -337,8 +382,11 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd,
             map_score = precision.compute()  # Tensor of size [num_classes] or scalar if average="macro"
             print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, Average Precisions: {map_score}")
 
-        if len(val_mlc_loaders) > 0 and epoch >= sgd_epoch and sgd_epoch > -1:
-            scheduler_sgd.step(val_mlc_loss)
+        if len(val_mlc_loaders) > 0:
+            if epoch >= sgd_epoch and sgd_epoch > -1:
+                scheduler_sgd.step(val_mlc_loss)
+            else:
+                scheduler_adamw.step()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
@@ -420,6 +468,8 @@ def main():
         {'params': model.classifier_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
     ], momentum=0.9, nesterov=True)
 
+    scheduler_adamw = optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=args.num_epochs)
+
     scheduler_sgd = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer_sgd,
         mode='min',          # minimize val_loss
@@ -434,7 +484,7 @@ def main():
         train_mlc_loaders = [endo_train_mlc_loader]
     val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
 
-    train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, scheduler_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders)
+    train_loop(args.num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sgd, scheduler_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders)
     if len(args.output_file) > 0:
         model.export(args.output_file)
 
