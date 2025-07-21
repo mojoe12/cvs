@@ -5,7 +5,7 @@ from torchvision import models, transforms
 from torchvision.transforms import functional as TF
 import torch.nn.functional as F
 from ultralytics import YOLO
-#from ultralytics.nn.modules.block import Concat, Detect, C2f, C3, Conv  # etc.
+import timm
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
 from pycocotools.coco import COCO
@@ -29,14 +29,22 @@ class PadToSquareHeight:
         padding = (0, pad, 0, w - h - pad)  # left, top, right, bottom
         return TF.pad(img, padding, fill=0, padding_mode='constant')
 
+class CropToSquareHeight:
+    def __call__(self, img):
+        w, h = img.size
+        if h >= w:
+            return img  # already tall or square
+        return transforms.CenterCrop(h)(img)
+
 class MultiLabelImageDataset(Dataset):
-    def __init__(self, image_dir, labels_and_confidences, height, width, augment):
+    def __init__(self, image_dir, labels_and_confidences, height, width, augment, pad_and_not_crop):
         # labels_and_confidences = {filename: ([0, 1, 1], [1.0, 0.6, 0.9])}
         self.image_dir = image_dir
         self.data = labels_and_confidences
         self.image_filenames = list(labels_and_confidences.keys())
+        square_transform = PadToSquareHeight() if pad_and_not_crop else CropToSquareHeight()
         self.transform = transforms.Compose([
-            PadToSquareHeight(),
+            square_transform,
             transforms.Resize((height, width)),
             transforms.ToTensor()
         ])
@@ -80,7 +88,7 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     }
 
     # Create dataset instance
-    dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment=augment)
+    dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment, pad_and_not_crop=False)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -185,7 +193,7 @@ class MultiLabelCNN(nn.Module):
 # output = model(torch.randn(8, 33, 80, 80))  # batch of 8
 # print(output.shape)  # -> torch.Size([8, 10])
 
-class MLCModel(nn.Module):
+class YoloMLCModel(nn.Module):
     def __init__(self, num_labels, model_name, use_y12):
         super().__init__()
         self.model_name = model_name
@@ -226,6 +234,36 @@ class MLCModel(nn.Module):
         # Save the model
         yolo.save(output_file)
         print(f"Model exported to: {output_file}")
+
+class TransformerModel(nn.Module):
+    def __init__(self, num_labels, model_name):
+        super().__init__()
+        # Load pretrained model
+        #self.backbone = timm.create_model('vit_base_patch16_224.mae', pretrained=True, num_classes=0)
+        #tested models: 'swinv2_base_window12to24_192to384.ms_in22k_ft_in1k'
+        #               'vit_base_patch16_224.mae'
+        #               'mambaout_femto.in1k'
+        self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
+        feature_channels = 1152 #self.backbone.feature_info[-1]['num_chs']
+        self.head = nn.Linear(feature_channels, num_labels)
+        # Replace classifier with multilabel output (3 labels)
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        return self.head(feats)
+
+    def backbone_parameters(self):
+        return self.backbone.parameters()
+
+    def classifier_parameters(self):
+        return self.head.parameters()
+
+    def set_backbone(self, requires_grad):
+        for param in self.backbone_parameters():
+            param.requires_grad = requires_grad
+
+    def export(self, output_file):
+        TODO
 
 # ==== Training ====
 def trainStep(model, dataloader, criterion, optimizer, device):
@@ -306,6 +344,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
     parser.add_argument('--model_name', type=str, required=True, help='Path to MLC model specification')
+    parser.add_argument('--image_size', type=int, required=True, help='Image Size. YOLO=640, transformers vary')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
     parser.add_argument('--unfreeze_epoch', type=int, default=-1, help='Epoch at which to unfreeze the backbone')
@@ -313,8 +352,8 @@ def parse_args():
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
 
-    parser.add_argument('--backbone_adam_lr', type=float, default=1e-3, help='Base Adam learning rate')
-    parser.add_argument('--classifier_adam_lr', type=float, default=1e-2, help='Classifier Adam learning rate')
+    parser.add_argument('--backbone_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
+    parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
     parser.add_argument('--backbone_sgd_lr', type=float, default=1e-3, help='Base SGD learning rate')
     parser.add_argument('--classifier_sgd_lr', type=float, default=1e-2, help='Classifier SGD learning rate')
 
@@ -325,6 +364,7 @@ def parse_args():
     parser.add_argument('--use_interpolated_cvs', action='store_true', help='Add in interpolated samples from CVS')
 
     parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
+    parser.add_argument('--use_transformer', action='store_true', help='Use transformer')
 
     parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
 
@@ -333,7 +373,7 @@ def parse_args():
 def main():
 
     args = parse_args()
-    height, width = 640, 640 # yolo specific
+    height, width = args.image_size, args.image_size
     print(f"MLC Model name: {args.model_name}")
     print(f"Num epochs: {args.num_epochs}")
     if args.sgd_epoch >= 0:
@@ -364,7 +404,10 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
+    if args.use_transformer:
+        model = TransformerModel(num_labels, args.model_name).to(device)
+    else:
+        model = YoloMLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
     model.set_backbone(False)
 
     optimizer_adamw = torch.optim.AdamW([
