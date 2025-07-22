@@ -6,7 +6,7 @@ input_path = "analysis/train_frame_interpolated.csv"
 df = pd.read_csv(input_path)
 
 # === Construct 'image' column ===
-df["image"] = df["dir_name"] + "_" + df["frame_id"].astype(str) + ".jpg"
+df["image"] = df["dir_name"].astype(str) + "_" + df["frame_id"].astype(str) + ".jpg"
 
 # === Compute temp_c1, temp_c2, temp_c3 ===
 df["c1"] = 0.5 + (

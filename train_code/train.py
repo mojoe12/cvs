@@ -409,7 +409,7 @@ def parse_args():
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
-    parser.add_argument('--use_interpolated_cvs', action='store_true', help='Add in interpolated samples from CVS')
+    parser.add_argument('--use_interpolated', action='store_true', help='Add in interpolated training samples')
 
     parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
     parser.add_argument('--use_transformer', action='store_true', help='Use transformer')
@@ -435,17 +435,18 @@ def main():
     print(f"Weight decay: backbone={args.backbone_weight_decay}, clf={args.classifier_weight_decay}")
     if args.use_endoscapes:
         print("Using endoscapes cvs 201 for additional training data")
-    if args.use_interpolated_cvs:
-        print("Using interpolated data from CVS")
+    if args.use_interpolated:
+        print("Using interpolated training data")
     if args.use_yolo12:
         print("Using YOLO 12 structure")
     if len(args.output_file) > 0:
         print(f"Logging to {args.output_file}")
 
-    endo_train_mlc_loader = getMLCLoader('analysis/endo_train_mlc_data.csv', 'endoscapes/train', True, height, width, args.mlc_batch_size)
+    endo_train_mlc_data_csv = 'analysis/endo_train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/endo_train_mlc_data.csv'
+    endo_train_mlc_loader = getMLCLoader(endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
     endo_val_mlc_loader = getMLCLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', False, height, width, args.mlc_batch_size)
     endo_test_mlc_loader = getMLCLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', False, height, width, args.mlc_batch_size)
-    train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated_cvs else 'analysis/train_mlc_data.csv'
+    train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/train_mlc_data.csv'
     cvs_train_mlc_loader = getMLCLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
     cvs_val_mlc_loader = getMLCLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 

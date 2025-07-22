@@ -10,7 +10,8 @@ df = df.sort_values(by=['dir_name', 'frame_id'])
 # Columns to interpolate
 rating_columns = [col for col in df.columns if col.startswith('c') and col != 'dir_name']
 
-frame_rate_before = 150 # this is a magic number
+frames_after = 5 # this is a magic number
+step = 30 # relative to frame rate
 
 # Function to interpolate per group
 def interpolate_group(group):
@@ -18,7 +19,7 @@ def interpolate_group(group):
     group = group.set_index('frame_id')
     
     # Create a new index from min to max in steps of 30
-    new_index = range(group.index.min(), group.index.max() + frame_rate_before, 30) # TODO this is a debatable decision
+    new_index = range(group.index.min(), group.index.max() + frames_after * step, step)
     
     # Reindex and interpolate linearly
     group_interp = group.reindex(new_index).interpolate(method='linear')
