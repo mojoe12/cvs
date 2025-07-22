@@ -77,7 +77,7 @@ class MultiLabelImageDataset(Dataset):
         label, confidence = self.data[filename]
         label = torch.tensor(label, dtype=torch.float32)
         confidence = torch.tensor(confidence, dtype=torch.float32)
-        confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32) # TODO decide
+        #confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32)
 
         return image, label, confidence
 
@@ -409,6 +409,7 @@ def parse_args():
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
     parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
+    parser.add_argument('--only_endoscapes', action='store_true', help='Train and validate on endoscapes only')
     parser.add_argument('--use_interpolated', action='store_true', help='Add in interpolated training samples')
 
     parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
@@ -435,6 +436,10 @@ def main():
     print(f"Weight decay: backbone={args.backbone_weight_decay}, clf={args.classifier_weight_decay}")
     if args.use_endoscapes:
         print("Using endoscapes cvs 201 for additional training data")
+    if args.only_endoscapes:
+        print("Training and validating only on endoscapes")
+    assert not args.use_endoscapes or not args.only_endoscapes
+
     if args.use_interpolated:
         print("Using interpolated training data")
     if args.use_yolo12:
@@ -481,9 +486,14 @@ def main():
 
     if args.use_endoscapes:
         train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader, endo_val_mlc_loader, endo_test_mlc_loader]
-    else:
+    elif args.only_endoscapes:
         train_mlc_loaders = [endo_train_mlc_loader]
-    val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
+    else:
+        train_mlc_loaders = [cvs_train_mlc_loader]
+    if args.only_endoscapes:
+        val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
+    else:
+        val_mlc_loaders = [cvs_val_mlc_loader]
 
     train_loop(args.num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sgd, scheduler_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders)
     if len(args.output_file) > 0:
