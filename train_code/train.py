@@ -102,127 +102,32 @@ def getMLCLoader(csv_file, image_path, augment, h, w, batch_size):
     )
     return loader
 
-class MultiScaleHead(nn.Module):
-    """
-    A head layer that takes three feature maps of different spatial resolutions
-    (HxW = 40x40, 80x80, 160x160), performs adaptive pooling, concatenates them,
-    and outputs multilabel classification logits for `num_labels` labels.
-    """
-    def __init__(self, detect, num_labels=3):
-        super(MultiScaleHead, self).__init__()
-
-        self.cv3 = detect.cv3
-        self.conv1 = nn.Sequential(
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 80x80 -> 40x40
-            nn.Conv2d(11, 128, kernel_size=3, padding=1),  # 80x80 -> 40x40
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),  # 40x40 -> 20x20
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),  # 40x40 -> 20x20
-            nn.ReLU()
-        )
-        self.conv2 = nn.Sequential(
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 80x80 -> 40x40
-            nn.Conv2d(11, 128, kernel_size=3, padding=1),  # 40x40 -> 20x20
-            nn.ReLU()
-        )
-        self.conv_final = nn.Sequential(
-            nn.MaxPool2d(2, 2),  # 20x20 -> 10x10
-            nn.Conv2d(256 + 128 + 11, 512, kernel_size=3, stride=1, padding=1), # 20x20 -> 10x10
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),  # 10x10 -> 1x1
-            nn.Flatten(),
-            nn.Linear(512, num_labels, bias=True)
-        )
-
-    def forward(self, inputs):
-        """
-        Args:
-            inputs (tuple of torch.Tensor): (x1, x2, x3) feature maps from
-                three scales with shapes:
-                x1: [N, C1, 40, 40]
-                x2: [N, C2, 80, 80]
-                x3: [N, C3, 160, 160]
-
-        Returns:
-            logits: [N, num_labels]
-        """
-        x1, x2, x3 = inputs
-        conv1 = self.conv1(self.cv3[0](x1))
-        conv2 = self.conv2(self.cv3[1](x2))
-        conv3 = self.cv3[2](x3)
-        conv_all = torch.cat((conv1, conv2, conv3), dim=1)
-        return self.conv_final(conv_all)
-
-class MultiLabelCNN(nn.Module):
-    def __init__(self, num_inputs, num_labels):
-        super(MultiLabelCNN, self).__init__()
-
-        ni1, ni2, ni3 = num_inputs
-        in_channels = ni1 + ni2 + ni3
-        # Conv Layers
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 80x80 → 40x40
-
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 40x40 → 20x20
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),  # 256 x 20 x 20 = 102400
-            nn.Linear(256 * 20 * 20, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_labels, bias=True),
-        )
-
-    def forward(self, inputs):
-        x1, x2, x3 = inputs
-        x2_upscale = F.interpolate(x2, scale_factor=2, mode='nearest')
-        x3_upscale = F.interpolate(x3, scale_factor=4, mode='nearest')
-        x = torch.cat((x1, x2_upscale, x3_upscale), dim=1)
-
-        x = self.features(x)
-        return self.classifier(x)
-
-# Example usage:
-# model = MultiLabelCNN(num_classes=10)
-# output = model(torch.randn(8, 33, 80, 80))  # batch of 8
-# print(output.shape)  # -> torch.Size([8, 10])
-
-class YoloMLCModel(nn.Module):
-    def __init__(self, num_labels, model_name, use_y12):
+class YoloSimpleMLCModel(nn.Module):
+    def __init__(self, num_labels, model_name):
         super().__init__()
         self.model_name = model_name
         yolo = YOLO(self.model_name)
-        self.output_indices = set([4, 6, 10])
-        self.head_layer = MultiLabelCNN((256, 256, 512), num_labels)
-        max_output_index = max(self.output_indices)
+        num_out_features = 512
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(num_out_features, num_labels)
+        )
+        max_head_len = 11
         self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(max_output_index + 1)
+            yolo.model.model[index] for index in range(min(max_head_len, len(yolo.model.model)-1))
         ])
 
     def forward(self, x):
-        outputs = []
         for idx, layer in enumerate(self.backbone_layers):
             x = layer(x)
-            if idx in self.output_indices:
-                outputs.append(x)
-        return self.head_layer(outputs)
+        return self.head(x)
 
     def backbone_parameters(self):
         return [p for layer in self.backbone_layers for p in layer.parameters()]
 
     def classifier_parameters(self):
-        return self.head_layer.parameters()
+        return self.head.parameters()
 
     def set_backbone(self, requires_grad):
         for param in self.backbone_parameters():
@@ -366,10 +271,9 @@ def train_loop(num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sg
             optimizer = optimizer_sgd
             print("Switched to SGD optimizer")
 
-        if epoch == unfreeze_epoch:
+        if epoch == unfreeze_epoch and unfreeze_epoch != 0:
             model.set_backbone(True)
             print("Unfroze backbone")
-
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_mlc_loader in enumerate(train_mlc_loaders):
@@ -395,7 +299,7 @@ def parse_args():
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. YOLO=640, transformers vary')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
-    parser.add_argument('--unfreeze_epoch', type=int, default=-1, help='Epoch at which to unfreeze the backbone')
+    parser.add_argument('--unfreeze_epoch', type=int, default=0, help='Epoch at which to unfreeze the backbone')
 
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
@@ -412,7 +316,6 @@ def parse_args():
     parser.add_argument('--only_endoscapes', action='store_true', help='Train and validate on endoscapes only')
     parser.add_argument('--use_interpolated', action='store_true', help='Add in interpolated training samples')
 
-    parser.add_argument('--use_yolo12', action='store_true', help='Use YOLO 12 structure')
     parser.add_argument('--use_transformer', action='store_true', help='Use transformer')
 
     parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
@@ -427,7 +330,7 @@ def main():
     print(f"Num epochs: {args.num_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
-    if args.unfreeze_epoch >= 0:
+    if args.unfreeze_epoch > 0:
         print(f"Unfreeze backbone at: {args.unfreeze_epoch}")
     print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr})")
@@ -442,8 +345,6 @@ def main():
 
     if args.use_interpolated:
         print("Using interpolated training data")
-    if args.use_yolo12:
-        print("Using YOLO 12 structure")
     if len(args.output_file) > 0:
         print(f"Logging to {args.output_file}")
 
@@ -461,8 +362,8 @@ def main():
     if args.use_transformer:
         model = TransformerModel(num_labels, args.model_name).to(device)
     else:
-        model = YoloMLCModel(num_labels, args.model_name, args.use_yolo12).to(device)
-    model.set_backbone(False)
+        model = YoloSimpleMLCModel(num_labels, args.model_name).to(device)
+    model.set_backbone(args.unfreeze_epoch == 0)
 
     optimizer_adamw = torch.optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
