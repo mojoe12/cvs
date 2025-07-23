@@ -133,18 +133,6 @@ class YoloSimpleMLCModel(nn.Module):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
 
-    def export(self, output_file):
-        # Load base YOLO model
-        yolo = YOLO(self.model_name)
-
-        # Replace backbone and head
-        for i, layer in enumerate(self.layers):
-            yolo.model.model[i] = self.layers[i]
-
-        # Save the model
-        yolo.save(output_file)
-        print(f"Model exported to: {output_file}")
-
 class YoloTransformerMLCModel(nn.Module):
     def __init__(self, num_labels, yolo_model_name, transformer_model_name):
         super().__init__()
@@ -183,18 +171,6 @@ class YoloTransformerMLCModel(nn.Module):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
 
-    def export(self, output_file):
-        # Load base YOLO model
-        yolo = YOLO(self.model_name)
-
-        # Replace backbone and head
-        for i, layer in enumerate(self.layers):
-            yolo.model.model[i] = self.layers[i]
-
-        # Save the model
-        yolo.save(output_file)
-        print(f"Model exported to: {output_file}")
-
 class TransformerMLCModel(nn.Module):
     def __init__(self, num_labels, model_name):
         super().__init__()
@@ -222,9 +198,6 @@ class TransformerMLCModel(nn.Module):
     def set_backbone(self, requires_grad):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
-
-    def export(self, output_file):
-        TODO
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -347,7 +320,8 @@ def parse_args():
 
     parser.add_argument('--transformer_model', type=str, default="", help='Path to Transformer model specification')
     parser.add_argument('--yolo_model', type=str, default="", help='Path to YOLO model specification')
-    parser.add_argument('--image_size', type=int, required=True, help='Image Size. YOLO=640, transformers vary')
+    parser.add_argument('--saved_weights', type=str, default="", help='Path to file representing model weights')
+    parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
     parser.add_argument('--unfreeze_epoch', type=int, default=0, help='Epoch at which to unfreeze the backbone')
@@ -408,19 +382,21 @@ def main():
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if len(args.transformer_model) > 0:
-        print("Using transformer model {args.transformer_model} as backbone")
+        print(f"Using transformer model {args.transformer_model} as backbone")
         if len(args.yolo_model) > 0:
-            print("Using yolo model {args.yolo_model} as backbone")
+            print(f"Using yolo model {args.yolo_model} as backbone")
             model = YoloTransformerMLCModel(num_labels, args.yolo_model, args.transformer_model).to(device)
         else:
             model = TransformerMLCModel(num_labels, args.transformer_model).to(device)
     else:
         if len(args.yolo_model) > 0:
-            print("Using yolo model {args.yolo_model} as backbone")
+            print(f"Using yolo model {args.yolo_model} as backbone")
             model = YoloSimpleMLCModel(num_labels, args.yolo_model).to(device)
         else:
             assert len(args.transformer_model) > 0 or len(args.yolo_model) > 0
     model.set_backbone(args.unfreeze_epoch == 0)
+    if len(args.saved_weights) > 0:
+        model.load_state_dict(torch.load(args.saved_weights))
 
     optimizer_adamw = torch.optim.AdamW([
         {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
@@ -455,7 +431,8 @@ def main():
 
     train_loop(args.num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sgd, scheduler_sgd, args.sgd_epoch, args.unfreeze_epoch, num_classes, num_labels, device, train_mlc_loaders, val_mlc_loaders)
     if len(args.output_file) > 0:
-        model.export(args.output_file)
+        torch.save(model.state_dict(), output_file)
+        print(f"Model weights exported to: {output_file}")
 
 if __name__ == "__main__":
     main()
