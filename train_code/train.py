@@ -113,9 +113,9 @@ class YoloSimpleMLCModel(nn.Module):
             nn.Flatten(),
             nn.Linear(num_out_features, num_labels)
         )
-        max_head_len = 11
+        max_head_index = 11
         self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(min(max_head_len, len(yolo.model.model)-1))
+            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
         ])
 
     def forward(self, x):
@@ -145,7 +145,57 @@ class YoloSimpleMLCModel(nn.Module):
         yolo.save(output_file)
         print(f"Model exported to: {output_file}")
 
-class TransformerModel(nn.Module):
+class YoloTransformerMLCModel(nn.Module):
+    def __init__(self, num_labels, yolo_model_name, transformer_model_name):
+        super().__init__()
+        self.yolo_model_name = yolo_model_name
+        yolo = YOLO(self.yolo_model_name)
+        num_out_features = 512
+        self.flatten_yolo = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+        )
+        max_head_index = 11
+        self.backbone_layers = nn.ModuleList([
+            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
+        ])
+        self.backbone = timm.create_model(transformer_model_name, pretrained=True)
+        feature_channels = self.backbone.feature_info[-1]['num_chs']
+        self.backbone.reset_classifier(0)
+        self.head = nn.Linear(feature_channels + num_out_features, num_labels, bias=True)
+
+    def forward(self, x):
+        yolo_x = x
+        for idx, layer in enumerate(self.backbone_layers):
+            yolo_x = layer(yolo_x)
+        yolo_x = self.flatten_yolo(yolo_x)
+        trans_x = self.backbone(x)
+        head_x = torch.cat([yolo_x, trans_x], dim=1)
+        return self.head(head_x)
+
+    def backbone_parameters(self):
+        return [p for layer in self.backbone_layers for p in layer.parameters()] + list(self.backbone.parameters())
+
+    def classifier_parameters(self):
+        return self.head.parameters()
+
+    def set_backbone(self, requires_grad):
+        for param in self.backbone_parameters():
+            param.requires_grad = requires_grad
+
+    def export(self, output_file):
+        # Load base YOLO model
+        yolo = YOLO(self.model_name)
+
+        # Replace backbone and head
+        for i, layer in enumerate(self.layers):
+            yolo.model.model[i] = self.layers[i]
+
+        # Save the model
+        yolo.save(output_file)
+        print(f"Model exported to: {output_file}")
+
+class TransformerMLCModel(nn.Module):
     def __init__(self, num_labels, model_name):
         super().__init__()
         # Load pretrained model
@@ -295,7 +345,8 @@ def train_loop(num_epochs, model, optimizer_adamw, scheduler_adamw, optimizer_sg
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
-    parser.add_argument('--model_name', type=str, required=True, help='Path to MLC model specification')
+    parser.add_argument('--transformer_model', type=str, default="", help='Path to Transformer model specification')
+    parser.add_argument('--yolo_model', type=str, default="", help='Path to YOLO model specification')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. YOLO=640, transformers vary')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
@@ -316,8 +367,6 @@ def parse_args():
     parser.add_argument('--only_endoscapes', action='store_true', help='Train and validate on endoscapes only')
     parser.add_argument('--use_interpolated', action='store_true', help='Add in interpolated training samples')
 
-    parser.add_argument('--use_transformer', action='store_true', help='Use transformer')
-
     parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
 
     return parser.parse_args()
@@ -326,7 +375,6 @@ def main():
 
     args = parse_args()
     height, width = args.image_size, args.image_size
-    print(f"MLC Model name: {args.model_name}")
     print(f"Num epochs: {args.num_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
@@ -359,10 +407,19 @@ def main():
     num_labels = 3
     num_classes = 7
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.use_transformer:
-        model = TransformerModel(num_labels, args.model_name).to(device)
+    if len(args.transformer_model) > 0:
+        print("Using transformer model {args.transformer_model} as backbone")
+        if len(args.yolo_model) > 0:
+            print("Using yolo model {args.yolo_model} as backbone")
+            model = YoloTransformerMLCModel(num_labels, args.yolo_model, args.transformer_model).to(device)
+        else:
+            model = TransformerMLCModel(num_labels, args.transformer_model).to(device)
     else:
-        model = YoloSimpleMLCModel(num_labels, args.model_name).to(device)
+        if len(args.yolo_model) > 0:
+            print("Using yolo model {args.yolo_model} as backbone")
+            model = YoloSimpleMLCModel(num_labels, args.yolo_model).to(device)
+        else:
+            assert len(args.transformer_model) > 0 or len(args.yolo_model) > 0
     model.set_backbone(args.unfreeze_epoch == 0)
 
     optimizer_adamw = torch.optim.AdamW([
