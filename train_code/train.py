@@ -55,14 +55,14 @@ class MultiLabelImageDataset(Dataset):
         ])
         self.random_erase = transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
 
+    def getFilenames(self):
+        return self.image_filenames
+
     def __len__(self):
         return len(self.image_filenames)
 
     def __getitem__(self, idx):
         filename = self.image_filenames[idx]
-        basename = os.path.splitext(os.path.basename(filename))[0]
-        video, frame_str = basename.rsplit('_', 1)
-        frame = int(frame_str)
         image_path = os.path.join(self.image_dir, filename)
         image = Image.open(image_path).convert('RGB')
         if self.augment:
@@ -106,56 +106,39 @@ def getMLCImageLoader(csv_file, image_path, augment, h, w, batch_size):
     return loader, dataset
 
 class MultiLabelVideoDataset(Dataset):
-    def __init__(self, features_labels_and_confidences):
-        # features_labels_and_confidences = [(features, labels, confidences)]
-        self.data = features_labels_and_confidences
+    def __init__(self, image_dataset, video_indices):
+        self.image_dataset = image_dataset
+        self.video_indices = features_labels_and_confidences
 
     def __len__(self):
-        return len(self.data)
+        return len(self.video_indices)
 
     def __getitem__(self, idx):
-        features, labels, confidences = self.data[idx]
-        return features, labels, confidences
+        video_images, video_labels, video_confidences = [], [], []
+        for index in video_indices[idx]:
+            image, label, confidence = self.image_dataset[index]
+            video_images.append(image)
+            video_labels.append(label)
+            video_confidences.append(confidence)
+        return torch.stack(video_images), torch.stack(video_labels), torch.stack(video_confidences)
 
-def getMLCVideoLoader(image_dataset, model, batch_size, device):
-    features_labels_and_confidences = []
-
-    curr_video = None
-    prev_frame = -1
-    video_index = 0
-    video_images, video_labels, video_confidences = [], [], []
-
-    def compute_video_features():
-        assert video_index == 18, f"Expected 18 frames, got {video_index} for video {curr_video}"
-        with torch.no_grad():
-            video_features = model(torch.stack(video_images).to(device), return_hidden=True).cpu()
-        new_video = (video_features, torch.stack(video_labels), torch.stack(video_confidences))
-        features_labels_and_confidences.append(new_video)
-
-    for image, label, confidence, video, frame in image_dataset:
-        if curr_video is not None and video != curr_video:
-            # Finalize previous video
-            compute_video_features()
-            # Reset for new video
-            video_images, video_labels, video_confidences = [], [], []
-            video_index = 0
-            prev_frame = -1
-
-        assert prev_frame < frame, f"Frame order issue in video {video}: {frame} after {prev_frame}"
-        prev_frame = frame
-        curr_video = video
-        video_index += 1
-        assert video_index <= 18, f"Too many frames in video {video}: {video_index}"
-
-        video_images.append(image)
-        video_labels.append(label)
-        video_confidences.append(confidence)
-
-    # Handle last video
-    compute_video_features()
+def getMLCVideoLoader(image_dataset, batch_size, device):
+    image_filenames = image_dataset.getFilenames()
+    video_frames = {}
+    for index, filename in enumerate(image_filenames):
+        basename = os.path.splitext(os.path.basename(filename))[0]
+        video, frame_str = basename.rsplit('_', 1)
+        frame = int(frame_str)
+        if video not in video_frames:
+            video_frames[video] = {}
+        video_frames[video][frame] = index
+    video_indices = []
+    for video_name, frames in video_frames.items():
+        video_indices.append(list(frames.values()))
+    print(video_indices)
 
     # Create dataset instance
-    dataset = MultiLabelVideoDataset(features_labels_and_confidences)
+    dataset = MultiLabelVideoDataset(image_dataset, video_indices)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -312,6 +295,47 @@ class TemporalMLCTCN(nn.Module):
         x = x.transpose(1, 2)         # [B, 18, 3]
         return x
 
+class TemporalMLCLSTM(nn.Module):
+    def __init__(self, input_dim=1536, hidden_dim=256, num_labels=3, num_layers=1, bidirectional=False):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=input_dim,
+                            hidden_size=hidden_dim,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            bidirectional=bidirectional)
+        self.classifier = nn.Linear(hidden_dim * (2 if bidirectional else 1), num_labels)
+
+    def forward(self, x):  # x: [B, 18, 1536]
+        x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
+        out = self.classifier(x)  # [B, 18, num_labels]
+        return out
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        """
+        logits: Tensor of shape (B, num_labels)
+        targets: Tensor of shape (B, num_labels), with 0s and 1s
+        """
+        probs = torch.sigmoid(logits)
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+
+        pt = probs * targets + (1 - probs) * (1 - targets)  # pt = p_t
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss  # shape: (B, num_labels)
+
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
     '''Returns mixed inputs, pairs of targets, and lambda'''
@@ -357,7 +381,6 @@ def cutmix_data(x, y, alpha=1.0):
         raise ValueError(f'Unsupported input dimension {x.dim()}, expected 3D or 4D tensor.')
     y_a, y_b = y, y[index]
     return x, y_a, y_b, lam
-
 
 def trainStep(model, dataloader, criterion, optimizer, device, max_norm):
     model.train()
@@ -410,6 +433,7 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
 def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, output_file, output_file_ext):
     # ---- Optimizer and Loss ----
     criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
+    criterion = FocalLoss(gamma=2.0, alpha=0.25)
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
     max_norm = 5
     scheduler_adamw = optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=num_epochs)
@@ -522,7 +546,7 @@ def main():
     endo_val_mlc_loader, _ = getMLCImageLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
     endo_test_mlc_loader, _ = getMLCImageLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
     train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/train_mlc_data.csv'
-    cvs_train_mlc_loader, _ = getMLCImageLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
+    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
     cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 
     num_labels = 3
@@ -543,6 +567,7 @@ def main():
             assert len(args.transformer_model) > 0 or len(args.yolo_model) > 0
     model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
+        print(f"Loading model weights from {args.output_file}.static_model.pth")
         model.load_state_dict(torch.load(args.saved_weights))
     assert len(args.saved_weights) > 0 or args.num_epochs > 0
 
@@ -568,18 +593,17 @@ def main():
         else:
             val_mlc_loaders = [cvs_val_mlc_loader]
 
-        train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_method.pth")
+        train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
-            model.load_state_dict(torch.load(args.output_file + ".static_method.pth"))
+            print(f"Loading model weights from {args.output_file}.static_model.pth")
+            model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
 
     if args.temporal_epochs > 0:
         # eval the hidden weights first
-        _, cvs_train_mlc_dataset = getMLCImageLoader('analysis/train_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
-        train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, model, 16, device)
-        val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, model, 16, device)
-        print("Computed features of video frames")
+        train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, args.mlc_batch_size, device)
+        val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, args.mlc_batch_size, device)
         #temporal_model = TemporalMLCPredictor(model.num_features, 192, num_labels).to(device)
-        temporal_model = TemporalMLCTCN(model.num_features, 128, num_labels, 3).to(device)
+        temporal_model = TemporalMLCLSTM(model, 128, num_labels, 3).to(device)
 
         optimizer_adamw = torch.optim.AdamW([
             {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
