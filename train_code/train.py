@@ -82,7 +82,7 @@ class MultiLabelImageDataset(Dataset):
         confidence = torch.tensor(confidence, dtype=torch.float32)
         #confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32)
 
-        return image, label, confidence, video, frame
+        return image, label, confidence
 
 def getMLCImageLoader(csv_file, image_path, augment, h, w, batch_size):
     # Transforms
@@ -108,14 +108,14 @@ def getMLCImageLoader(csv_file, image_path, augment, h, w, batch_size):
 class MultiLabelVideoDataset(Dataset):
     def __init__(self, image_dataset, video_indices):
         self.image_dataset = image_dataset
-        self.video_indices = features_labels_and_confidences
+        self.video_indices = video_indices
 
     def __len__(self):
         return len(self.video_indices)
 
     def __getitem__(self, idx):
         video_images, video_labels, video_confidences = [], [], []
-        for index in video_indices[idx]:
+        for index in self.video_indices[idx]:
             image, label, confidence = self.image_dataset[index]
             video_images.append(image)
             video_labels.append(label)
@@ -135,7 +135,6 @@ def getMLCVideoLoader(image_dataset, batch_size, device):
     video_indices = []
     for video_name, frames in video_frames.items():
         video_indices.append(list(frames.values()))
-    print(video_indices)
 
     # Create dataset instance
     dataset = MultiLabelVideoDataset(image_dataset, video_indices)
@@ -246,19 +245,22 @@ class TransformerMLCModel(nn.Module):
             param.requires_grad = requires_grad
 
 class TemporalMLCPredictor(nn.Module):
-    def __init__(self, feature_dim, hidden_dim, num_labels, num_layers=2, num_heads=4):
+    def __init__(self, model, hidden_dim, num_labels, num_layers=2, num_heads=4):
         super().__init__()
-        self.projection = nn.Linear(feature_dim, hidden_dim)
+        self.static_model = model
+        self.projection = nn.Linear(model.num_features, hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.classifier = nn.Linear(hidden_dim, num_labels)
 
-    def forward(self, x):  # x: (B, 18, hidden_dim)
+    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
+        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
         x = self.projection(x)
-        x = x.permute(1, 0, 2)  # Transformer expects (seq_len, batch, hidden_dim)
+        x = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, hidden_dim]
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # Back to (B, 18, hidden_dim)
-        out = self.classifier(x)  # (B, 18, num_labels)
+        x = x.permute(1, 0, 2)  # Back to [B, 18, hidden_dim]
+        out = self.classifier(x)  # [B, 18, num_labels]
         return out
 
 class ResidualBlock(nn.Module):
@@ -279,15 +281,18 @@ class ResidualBlock(nn.Module):
         return x
 
 class TemporalMLCTCN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_labels, num_blocks):
+    def __init__(self, model, hidden_dim, num_labels, num_blocks):
         super().__init__()
-        self.input_proj = nn.Conv1d(input_dim, hidden_dim, kernel_size=1)
+        self.static_model = model
+        self.input_proj = nn.Conv1d(model.num_features, hidden_dim, kernel_size=1)
         self.blocks = nn.Sequential(*[
             ResidualBlock(hidden_dim, dilation=2**i) for i in range(num_blocks)
         ])
         self.output_proj = nn.Conv1d(hidden_dim, num_labels, kernel_size=1)
 
-    def forward(self, x):  # x: [B, 18, 1536]
+    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
+        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1)
         x = x.transpose(1, 2)         # [B, 1536, 18] → [B, C, T]
         x = self.input_proj(x)        # [B, hidden_dim, 18]
         x = self.blocks(x)            # temporal modeling
@@ -296,16 +301,19 @@ class TemporalMLCTCN(nn.Module):
         return x
 
 class TemporalMLCLSTM(nn.Module):
-    def __init__(self, input_dim=1536, hidden_dim=256, num_labels=3, num_layers=1, bidirectional=False):
+    def __init__(self, model, hidden_dim=256, num_labels=3, num_layers=1, bidirectional=False):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=input_dim,
+        self.static_model = model
+        self.lstm = nn.LSTM(input_size=model.num_features,
                             hidden_size=hidden_dim,
                             num_layers=num_layers,
                             batch_first=True,
                             bidirectional=bidirectional)
         self.classifier = nn.Linear(hidden_dim * (2 if bidirectional else 1), num_labels)
 
-    def forward(self, x):  # x: [B, 18, 1536]
+    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
+        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1)
         x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
         out = self.classifier(x)  # [B, 18, num_labels]
         return out
@@ -322,6 +330,10 @@ class FocalLoss(nn.Module):
         logits: Tensor of shape (B, num_labels)
         targets: Tensor of shape (B, num_labels), with 0s and 1s
         """
+        # Flatten to (B*T, C)
+        logits = logits.view(-1, logits.size(-1))
+        targets = targets.view(-1, targets.size(-1))
+
         probs = torch.sigmoid(logits)
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 
@@ -385,7 +397,7 @@ def cutmix_data(x, y, alpha=1.0):
 def trainStep(model, dataloader, criterion, optimizer, device, max_norm):
     model.train()
     total_loss = 0
-    for images, labels, confidences, *rest in dataloader:
+    for images, labels, confidences in dataloader:
         images = images.to(device)
         labels = labels.to(device)
         confidences = confidences.to(device)
@@ -411,7 +423,7 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
     all_labels = []
 
     with torch.no_grad():
-        for images, labels, confidences, *rest in dataloader:
+        for images, labels, confidences in dataloader:
             images = images.to(device)
             labels = labels.to(device)
             confidences = confidences.to(device)
@@ -600,8 +612,9 @@ def main():
 
     if args.temporal_epochs > 0:
         # eval the hidden weights first
-        train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, args.mlc_batch_size, device)
-        val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, args.mlc_batch_size, device)
+        batch_size = max(1, args.mlc_batch_size // 18)
+        train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, batch_size, device)
+        val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, batch_size, device)
         #temporal_model = TemporalMLCPredictor(model.num_features, 192, num_labels).to(device)
         temporal_model = TemporalMLCLSTM(model, 128, num_labels, 3).to(device)
 
