@@ -255,7 +255,7 @@ class TemporalMLCPredictor(nn.Module):
 
     def forward(self, x):  # x: [B, 18, 3, 384, 384]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
+        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
         x = self.projection(x)
         x = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, hidden_dim]
         x = self.transformer(x)
@@ -292,7 +292,7 @@ class TemporalMLCTCN(nn.Module):
 
     def forward(self, x):  # x: [B, 18, 3, 384, 384]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1)
+        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
         x = x.transpose(1, 2)         # [B, 1536, 18] → [B, C, T]
         x = self.input_proj(x)        # [B, hidden_dim, 18]
         x = self.blocks(x)            # temporal modeling
@@ -313,17 +313,16 @@ class TemporalMLCLSTM(nn.Module):
 
     def forward(self, x):  # x: [B, 18, 3, 384, 384]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped).view(x.size(0), x.size(1), -1)
+        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
         x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
         out = self.classifier(x)  # [B, 18, num_labels]
         return out
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.25, reduction='mean'):
+    def __init__(self, gamma=2.0, alpha=0.25):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.reduction = reduction
 
     def forward(self, logits, targets):
         """
@@ -331,8 +330,11 @@ class FocalLoss(nn.Module):
         targets: Tensor of shape (B, num_labels), with 0s and 1s
         """
         # Flatten to (B*T, C)
-        logits = logits.view(-1, logits.size(-1))
-        targets = targets.view(-1, targets.size(-1))
+        dim = logits.dim()
+        if dim == 3:
+            B, T = logits.size(0), logits.size(1)
+            logits = logits.view(-1, logits.size(-1))
+            targets = targets.view(-1, targets.size(-1))
 
         probs = torch.sigmoid(logits)
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
@@ -341,12 +343,54 @@ class FocalLoss(nn.Module):
         alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
         focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
 
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss  # shape: (B, num_labels)
+        return focal_loss.view(B, T, -1) if dim == 3 else focal_loss
+
+class AsymmetricLoss(nn.Module):
+    def __init__(self, gamma_pos=0, gamma_neg=4, clip=0.05, eps=1e-8):
+        """
+        gamma_pos: Focusing parameter for positive samples
+        gamma_neg: Focusing parameter for negative samples
+        clip: Optional clipping of negative prediction probabilities (to avoid overconfidence)
+        eps: Numerical stability
+        reduction: 'mean' or 'sum'
+        """
+        super().__init__()
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        """
+        logits: raw predictions [batch_size, num_classes]
+        targets: binary labels [batch_size, num_classes]
+        """
+        # Flatten to (B*T, C)
+        dim = logits.dim()
+        if dim == 3:
+            B, T = logits.size(0), logits.size(1)
+            logits = logits.view(-1, logits.size(-1))
+            targets = targets.view(-1, targets.size(-1))
+
+        # Convert logits to probabilities
+        probs = torch.sigmoid(logits)
+        probs_pos = probs
+        probs_neg = 1 - probs
+
+        # Optional clip on negative probs to prevent over-confidence
+        if self.clip is not None and self.clip > 0:
+            probs_neg = (probs_neg + self.clip).clamp(max=1)
+
+        # Compute log-likelihood
+        log_pos = torch.log(probs_pos.clamp(min=self.eps))
+        log_neg = torch.log(probs_neg.clamp(min=self.eps))
+
+        # Asymmetric focusing
+        loss_pos = targets * (1 - probs_pos) ** self.gamma_pos * log_pos
+        loss_neg = (1 - targets) * probs_pos ** self.gamma_neg * log_neg
+
+        loss = - (loss_pos + loss_neg)
+        return loss.view(B, T, -1) if dim == 3 else loss
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -389,8 +433,20 @@ def cutmix_data(x, y, alpha=1.0):
         end = np.clip(cx + cut_len // 2, 0, L)
         x[:, start:end, :] = x[index, start:end, :]
         lam = 1 - ((end - start) / L)
+    elif x.dim() == 5:  # Video: (B, T, C, H, W)
+        _, T, C, H, W = x.size()
+        cut_w = int(W * np.sqrt(1 - lam))
+        cut_h = int(H * np.sqrt(1 - lam))
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+        x1 = np.clip(cx - cut_w // 2, 0, W)
+        y1 = np.clip(cy - cut_h // 2, 0, H)
+        x2 = np.clip(cx + cut_w // 2, 0, W)
+        y2 = np.clip(cy + cut_h // 2, 0, H)
+        x[:, :, :, y1:y2, x1:x2] = x[index, :, :, y1:y2, x1:x2]
+        lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
     else:
-        raise ValueError(f'Unsupported input dimension {x.dim()}, expected 3D or 4D tensor.')
+        raise ValueError(f'Unsupported input dimension {x.dim()}, expected 3D or 4D or 5D tensor.')
     y_a, y_b = y, y[index]
     return x, y_a, y_b, lam
 
@@ -444,11 +500,18 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
 
 def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, output_file, output_file_ext):
     # ---- Optimizer and Loss ----
-    criterion = nn.BCEWithLogitsLoss(reduction='none')  # Keep per-label loss
-    criterion = FocalLoss(gamma=2.0, alpha=0.25)
+    criterion = AsymmetricLoss(gamma_pos=0, gamma_neg=4, clip=0.05)
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
     max_norm = 5
-    scheduler_adamw = optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=num_epochs)
+    num_warmup = 5
+    scheduler_adamw = optim.lr_scheduler.SequentialLR(
+        optimizer_adamw,
+        schedulers=[
+            optim.lr_scheduler.LinearLR(optimizer_adamw, start_factor=1e-2, total_iters=num_warmup),
+            optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=num_epochs-num_warmup)
+        ],
+        milestones=[num_warmup]
+    )
     scheduler_sgd = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer_sgd,
         mode='min',          # minimize val_loss
@@ -457,7 +520,7 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
         min_lr=1e-6          # don’t reduce below this
     )
     optimizer = optimizer_adamw
-    best_val_loss = float('inf')
+    best_avg_precision = 0.
 
     # ---- Training Loop ----
     for epoch in range(num_epochs):
@@ -477,11 +540,11 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
         for d, val_mlc_loader in enumerate(val_mlc_loaders):
             precision.reset()
             val_mlc_loss = validateMLCStep(model, val_mlc_loader, criterion, device, precision)
-            map_score = precision.compute()  # Tensor of size [num_labels] or scalar if average="macro"
-            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, Average Precisions: {map_score}")
+            map_score = precision.compute().cpu() # Tensor of size [num_labels] or scalar if average="macro"
+            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, Average Precision is {map_score.mean():.4f}: {map_score}")
 
-            if d == 0 and val_mlc_loss < best_val_loss and len(output_file) > 0:
-                best_val_loss = val_mlc_loss
+            if d == 0 and map_score.mean() > best_avg_precision and len(output_file) > 0:
+                best_avg_precision = map_score.mean()
                 torch.save(model.state_dict(), output_file + output_file_ext)
                 print(f"Model improved. Weights saved to: {output_file + output_file_ext}")
 
@@ -581,7 +644,7 @@ def main():
     if len(args.saved_weights) > 0:
         print(f"Loading model weights from {args.output_file}.static_model.pth")
         model.load_state_dict(torch.load(args.saved_weights))
-    assert len(args.saved_weights) > 0 or args.num_epochs > 0
+    assert (len(args.saved_weights) > 0) != (args.num_epochs > 0)
 
     assert args.num_epochs > 0 or args.temporal_epochs > 0
     if args.num_epochs > 0:
@@ -611,8 +674,10 @@ def main():
             model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
 
     if args.temporal_epochs > 0:
+        model.set_backbone(False)
         # eval the hidden weights first
-        batch_size = max(1, args.mlc_batch_size // 18)
+        batch_size = max(2, args.mlc_batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
+        print(f"Using batch size {batch_size} for temporal model training")
         train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, batch_size, device)
         val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, batch_size, device)
         #temporal_model = TemporalMLCPredictor(model.num_features, 192, num_labels).to(device)
