@@ -1,0 +1,2 @@
+train_code/model_weights.static_model.pth filter=lfs diff=lfs merge=lfs -text
+train_code/model_weights.temporal_model.pth filter=lfs diff=lfs merge=lfs -text
