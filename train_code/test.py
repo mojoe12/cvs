@@ -1,24 +1,14 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torchvision import models, transforms
 from torchvision.transforms import functional as TF
 import torch.nn.functional as F
-from ultralytics import YOLO
 import timm
-from torch.utils.data import DataLoader, Dataset, Subset
-from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
-from pycocotools.coco import COCO
-from torchmetrics import AveragePrecision
-import matplotlib.pyplot as plt
-import skimage.transform as st
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from PIL import Image
 import os
-import pandas as pd
-import random
 import argparse
-import copy
 import json
 import time
 
@@ -78,20 +68,37 @@ def getMLCImageLoader(image_path, image_json, h, w, batch_size):
     return loader, dataset
 
 class MultiLabelVideoDataset(Dataset):
-    def __init__(self, image_dataset, video_indices):
-        self.image_dataset = image_dataset
+    def __init__(self, image_dataset, video_indices, preload=False):
         self.video_indices = video_indices
+
+        if preload:
+            print("Preloading images into RAM...")
+            self.images = []
+            self.filenames = []
+            for idx in range(len(image_dataset)):
+                img, fname = image_dataset[idx]
+                self.images.append(img)
+                self.filenames.append(fname)
+        else:
+            self.image_dataset = image_dataset
+            self.images = None
+            self.filenames = None
 
     def __len__(self):
         return len(self.video_indices)
 
     def __getitem__(self, idx):
-        video_images, video_filenames = [], []
-        for index in self.video_indices[idx]:
-            image, filename = self.image_dataset[index]
-            video_images.append(image)
-            video_filenames.append(filename)
-        return torch.stack(video_images), video_filenames
+        img_list, fname_list = [], []
+        for frame_idx in self.video_indices[idx]:
+            if self.images is not None:  # Preloaded
+                img_list.append(self.images[frame_idx])
+                fname_list.append(self.filenames[frame_idx])
+            else:  # Load on demand
+                img, fname = self.image_dataset[frame_idx]
+                img_list.append(img)
+                fname_list.append(fname)
+
+        return torch.stack(img_list), fname_list
 
 def getMLCVideoLoader(image_dataset, batch_size, device):
     image_filenames = image_dataset.getFilenames()
@@ -283,28 +290,10 @@ class TemporalMLCLSTM(nn.Module):
         self.classifier = nn.Linear(hidden_dim * (2 if bidirectional else 1), num_labels)
 
     def forward(self, x):  # x: [B, 18, 3, 384, 384]
-        # 1. Select fewer frames for the backbone
-        useful_indices = torch.tensor([1, 3, 5, 7, 15], device=x.device)
-        x_subset = x[:, useful_indices]  # [B, 5, 3, H, W]
-
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        feats = self.static_model(x_reshaped, return_hidden=True)
-
-        feats = feats.view(x.size(0), x.size(1), -1)
-        
-        # 3. LSTM over reduced time steps
-        lstm_out, _ = self.lstm(feats)  # [B, 5, hidden]
-        
-        # 4. Interpolate back to 18 steps
-        lstm_out_interp = F.interpolate(
-            lstm_out.transpose(1, 2),  # [B, hidden, 5]
-            size=18,                    # 18
-            mode='linear',
-            align_corners=True
-        ).transpose(1, 2)  # [B, 18, hidden]
-        
-        # 5. Classify
-        out = self.classifier(lstm_out_interp)  # [B, 18, num_labels]
+        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
+        x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
+        out = self.classifier(x)  # [B, 18, num_labels]
         return out
 
 def evalModel(model, dataloader, device, output_file):
