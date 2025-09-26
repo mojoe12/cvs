@@ -124,77 +124,7 @@ def getMLCVideoLoader(image_dataset, batch_size, device):
     )
     return loader
 
-class YoloSimpleMLCModel(nn.Module):
-    def __init__(self, num_labels, model_name):
-        super().__init__()
-        self.model_name = model_name
-        yolo = YOLO(self.model_name)
-        self.num_features = 512
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.num_features, num_labels)
-        )
-        max_head_index = 11
-        self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
-        ])
-
-    def forward(self, x, return_hidden=False):
-        for idx, layer in enumerate(self.backbone_layers):
-            x = layer(x)
-        return x if return_hidden else self.head(x)
-
-    def backbone_parameters(self):
-        return [p for layer in self.backbone_layers for p in layer.parameters()]
-
-    def classifier_parameters(self):
-        return self.head.parameters()
-
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
-class YoloTransformerMLCModel(nn.Module):
-    def __init__(self, num_labels, yolo_model_name, transformer_model_name):
-        super().__init__()
-        self.yolo_model_name = yolo_model_name
-        yolo = YOLO(self.yolo_model_name)
-        num_out_features = 512
-        self.flatten_yolo = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-        )
-        max_head_index = 11
-        self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
-        ])
-        self.backbone = timm.create_model(transformer_model_name, pretrained=True)
-        feature_channels = self.backbone.feature_info[-1]['num_chs']
-        self.num_features = feature_channels + num_out_features
-        self.backbone.reset_classifier(0)
-        self.head = nn.Linear(self.num_features, num_labels, bias=True)
-
-    def forward(self, x, return_hidden=False):
-        yolo_x = x
-        for idx, layer in enumerate(self.backbone_layers):
-            yolo_x = layer(yolo_x)
-        yolo_x = self.flatten_yolo(yolo_x)
-        trans_x = self.backbone(x)
-        head_x = torch.cat([yolo_x, trans_x], dim=1)
-        return head_x if return_hidden else self.head(head_x)
-
-    def backbone_parameters(self):
-        return [p for layer in self.backbone_layers for p in layer.parameters()] + list(self.backbone.parameters())
-
-    def classifier_parameters(self):
-        return self.head.parameters()
-
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
-class TransformerMLCModel(nn.Module):
+class TimmMLCModel(nn.Module):
     def __init__(self, num_labels, model_name):
         super().__init__()
         # Load pretrained model
@@ -227,16 +157,16 @@ class TemporalMLCPredictor(nn.Module):
         super().__init__()
         self.static_model = model
         self.projection = nn.Linear(model.num_features, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        encoder_layer = nn.TimmEncoderLayer(d_model=hidden_dim, nhead=num_heads)
+        self.timm = nn.TimmEncoder(encoder_layer, num_layers=num_layers)
         self.classifier = nn.Linear(hidden_dim, num_labels)
 
     def forward(self, x):  # x: [B, 18, 3, 384, 384]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
         x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
         x = self.projection(x)
-        x = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, hidden_dim]
-        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # Timm expects [seq_len, batch, hidden_dim]
+        x = self.timm(x)
         x = x.permute(1, 0, 2)  # Back to [B, 18, hidden_dim]
         out = self.classifier(x)  # [B, 18, num_labels]
         return out
@@ -332,8 +262,7 @@ def evalModel(model, dataloader, device, output_file):
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
-    parser.add_argument('--transformer_model', type=str, default="", help='Path to Transformer model specification')
-    parser.add_argument('--yolo_model', type=str, default="", help='Path to YOLO model specification')
+    parser.add_argument('--timm_model', type=str, required=True, help='Path to Timm model specification')
     parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
@@ -351,19 +280,9 @@ def main():
     num_labels = 3
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
-    if len(args.transformer_model) > 0:
-        print(f"Using transformer model {args.transformer_model} as backbone")
-        if len(args.yolo_model) > 0:
-            print(f"Using yolo model {args.yolo_model} as backbone")
-            model = YoloTransformerMLCModel(num_labels, args.yolo_model, args.transformer_model).to(device)
-        else:
-            model = TransformerMLCModel(num_labels, args.transformer_model).to(device)
-    else:
-        if len(args.yolo_model) > 0:
-            print(f"Using yolo model {args.yolo_model} as backbone")
-            model = YoloSimpleMLCModel(num_labels, args.yolo_model).to(device)
-        else:
-            assert len(args.transformer_model) > 0 or len(args.yolo_model) > 0
+    assert len(args.timm_model) > 0
+    print(f"Using timm model {args.timm_model} as backbone")
+    model = TimmMLCModel(num_labels, args.timm_model).to(device)
     model.set_backbone(False)
     temporal_model = TemporalMLCLSTM(model, 128, num_labels, 3).to(device)
     assert len(args.saved_weights) > 0
