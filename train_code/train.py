@@ -1,396 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import models, transforms
-from torchvision.transforms import functional as TF
-import torch.nn.functional as F
-from ultralytics import YOLO
-import timm
 from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.metrics import f1_score, average_precision_score, confusion_matrix
-from pycocotools.coco import COCO
 from torchmetrics import AveragePrecision
-import matplotlib.pyplot as plt
-import skimage.transform as st
 import numpy as np
-from PIL import Image
-import os
-import pandas as pd
 import random
 import argparse
-import copy
-
-class PadToSquareHeight:
-    def __call__(self, img):
-        w, h = img.size
-        if h >= w:
-            return img  # already tall or square
-        pad = (w - h) // 2
-        padding = (0, pad, 0, w - h - pad)  # left, top, right, bottom
-        return TF.pad(img, padding, fill=0, padding_mode='constant')
-
-class CropToSquareHeight:
-    def __call__(self, img):
-        w, h = img.size
-        if h >= w:
-            return img  # already tall or square
-        return transforms.CenterCrop(h)(img)
-
-class MultiLabelImageDataset(Dataset):
-    def __init__(self, image_dir, labels_and_confidences, height, width, augment, pad_and_not_crop):
-        # labels_and_confidences = {filename: ([0, 1, 1], [1.0, 0.6, 0.9])}
-        self.image_dir = image_dir
-        self.data = labels_and_confidences
-        self.image_filenames = list(labels_and_confidences.keys())
-        square_transform = PadToSquareHeight() if pad_and_not_crop else CropToSquareHeight()
-        self.transform = transforms.Compose([
-            square_transform,
-            transforms.Resize((height, width)),
-            transforms.ToTensor()
-        ])
-        self.augment = augment
-        self.image_only_transforms = transforms.Compose([
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-            transforms.RandAugment(num_ops=16, magnitude=4),
-        ])
-        self.random_erase = transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
-
-    def getFilenames(self):
-        return self.image_filenames
-
-    def __len__(self):
-        return len(self.image_filenames)
-
-    def __getitem__(self, idx):
-        filename = self.image_filenames[idx]
-        image_path = os.path.join(self.image_dir, filename)
-        image = Image.open(image_path).convert('RGB')
-        if self.augment:
-            if random.random() > 0.5:
-                image = TF.hflip(image)
-            if random.random() > 0.5:
-                image = TF.vflip(image)
-            angle = random.choice([0, 90, 180, 270])
-            image = TF.rotate(image, angle)
-            # Apply image-only transforms
-            image = self.image_only_transforms(image)
-        image = self.transform(image)
-        if self.augment:
-            image = self.random_erase(image)
-        label, confidence = self.data[filename]
-        label = torch.tensor(label, dtype=torch.float32)
-        confidence = torch.tensor(confidence, dtype=torch.float32)
-        #confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32)
-
-        return image, label, confidence
-
-def getMLCImageLoader(csv_file, image_path, augment, h, w, batch_size):
-    # Transforms
-    my_df = pd.read_csv(csv_file)
-    labels_confidences_dict = {
-        row['image']: (
-            [row['c1'], row['c2'], row['c3']],
-            [row['weight_c1'], row['weight_c2'], row['weight_c3']]
-        )
-        for _, row in my_df.iterrows()
-    }
-
-    # Create dataset instance
-    dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment, pad_and_not_crop=False)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4
-    )
-    return loader, dataset
-
-class MultiLabelVideoDataset(Dataset):
-    def __init__(self, image_dataset, video_indices):
-        self.image_dataset = image_dataset
-        self.video_indices = video_indices
-
-    def __len__(self):
-        return len(self.video_indices)
-
-    def __getitem__(self, idx):
-        video_images, video_labels, video_confidences = [], [], []
-        for index in self.video_indices[idx]:
-            image, label, confidence = self.image_dataset[index]
-            video_images.append(image)
-            video_labels.append(label)
-            video_confidences.append(confidence)
-        return torch.stack(video_images), torch.stack(video_labels), torch.stack(video_confidences)
-
-def getMLCVideoLoader(image_dataset, batch_size, device):
-    image_filenames = image_dataset.getFilenames()
-    video_frames = {}
-    for index, filename in enumerate(image_filenames):
-        basename = os.path.splitext(os.path.basename(filename))[0]
-        video, frame_str = basename.rsplit('_', 1)
-        frame = int(frame_str)
-        if video not in video_frames:
-            video_frames[video] = {}
-        video_frames[video][frame] = index
-    video_indices = []
-    for video_name, frames in video_frames.items():
-        video_indices.append(list(frames.values()))
-
-    # Create dataset instance
-    dataset = MultiLabelVideoDataset(image_dataset, video_indices)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4
-    )
-    return loader
-
-class YoloSimpleMLCModel(nn.Module):
-    def __init__(self, num_labels, model_name):
-        super().__init__()
-        self.model_name = model_name
-        yolo = YOLO(self.model_name)
-        self.num_features = 512
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(self.num_features, num_labels)
-        )
-        max_head_index = 11
-        self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
-        ])
-
-    def forward(self, x, return_hidden=False):
-        for idx, layer in enumerate(self.backbone_layers):
-            x = layer(x)
-        return x if return_hidden else self.head(x)
-
-    def backbone_parameters(self):
-        return [p for layer in self.backbone_layers for p in layer.parameters()]
-
-    def classifier_parameters(self):
-        return self.head.parameters()
-
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
-class YoloTransformerMLCModel(nn.Module):
-    def __init__(self, num_labels, yolo_model_name, transformer_model_name):
-        super().__init__()
-        self.yolo_model_name = yolo_model_name
-        yolo = YOLO(self.yolo_model_name)
-        num_out_features = 512
-        self.flatten_yolo = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-        )
-        max_head_index = 11
-        self.backbone_layers = nn.ModuleList([
-            yolo.model.model[index] for index in range(min(max_head_index, len(yolo.model.model)-1))
-        ])
-        self.backbone = timm.create_model(transformer_model_name, pretrained=True)
-        feature_channels = self.backbone.feature_info[-1]['num_chs']
-        self.num_features = feature_channels + num_out_features
-        self.backbone.reset_classifier(0)
-        self.head = nn.Linear(self.num_features, num_labels, bias=True)
-
-    def forward(self, x, return_hidden=False):
-        yolo_x = x
-        for idx, layer in enumerate(self.backbone_layers):
-            yolo_x = layer(yolo_x)
-        yolo_x = self.flatten_yolo(yolo_x)
-        trans_x = self.backbone(x)
-        head_x = torch.cat([yolo_x, trans_x], dim=1)
-        return head_x if return_hidden else self.head(head_x)
-
-    def backbone_parameters(self):
-        return [p for layer in self.backbone_layers for p in layer.parameters()] + list(self.backbone.parameters())
-
-    def classifier_parameters(self):
-        return self.head.parameters()
-
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
-class TransformerMLCModel(nn.Module):
-    def __init__(self, num_labels, model_name):
-        super().__init__()
-        # Load pretrained model
-        #self.backbone = timm.create_model('vit_base_patch16_224.mae', pretrained=True, num_classes=0)
-        #tested models: 'swinv2_base_window12to24_192to384.ms_in22k_ft_in1k'
-        #               'vit_base_patch16_224.mae'
-        #               'mambaout_femto.in1k'
-        self.backbone = timm.create_model(model_name, pretrained=True)
-        self.num_features = self.backbone.feature_info[-1]['num_chs']
-        self.backbone.reset_classifier(0)
-        self.head = nn.Linear(self.num_features, num_labels, bias=True)
-        # Replace classifier with multilabel output (3 labels)
-
-    def forward(self, x, return_hidden=False):
-        feats = self.backbone(x)
-        return feats if return_hidden else self.head(feats)
-
-    def backbone_parameters(self):
-        return self.backbone.parameters()
-
-    def classifier_parameters(self):
-        return self.head.parameters()
-
-    def set_backbone(self, requires_grad):
-        for param in self.backbone_parameters():
-            param.requires_grad = requires_grad
-
-class TemporalMLCPredictor(nn.Module):
-    def __init__(self, model, hidden_dim, num_labels, num_layers=2, num_heads=4):
-        super().__init__()
-        self.static_model = model
-        self.projection = nn.Linear(model.num_features, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.classifier = nn.Linear(hidden_dim, num_labels)
-
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
-        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
-        x = self.projection(x)
-        x = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, hidden_dim]
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # Back to [B, 18, hidden_dim]
-        out = self.classifier(x)  # [B, 18, num_labels]
-        return out
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels, dilation):
-        super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
-        self.downsample = nn.Identity()  # Keep for structure
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):  # x: [B, C, T]
-        residual = x
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x += residual  # Residual connection
-        return x
-
-class TemporalMLCTCN(nn.Module):
-    def __init__(self, model, hidden_dim, num_labels, num_blocks):
-        super().__init__()
-        self.static_model = model
-        self.input_proj = nn.Conv1d(model.num_features, hidden_dim, kernel_size=1)
-        self.blocks = nn.Sequential(*[
-            ResidualBlock(hidden_dim, dilation=2**i) for i in range(num_blocks)
-        ])
-        self.output_proj = nn.Conv1d(hidden_dim, num_labels, kernel_size=1)
-
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
-        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
-        x = x.transpose(1, 2)         # [B, 1536, 18] → [B, C, T]
-        x = self.input_proj(x)        # [B, hidden_dim, 18]
-        x = self.blocks(x)            # temporal modeling
-        x = self.output_proj(x)      # [B, 3, 18]
-        x = x.transpose(1, 2)         # [B, 18, 3]
-        return x
-
-class TemporalMLCLSTM(nn.Module):
-    def __init__(self, model, hidden_dim=256, num_labels=3, num_layers=1, bidirectional=False):
-        super().__init__()
-        self.static_model = model
-        self.lstm = nn.LSTM(input_size=model.num_features,
-                            hidden_size=hidden_dim,
-                            num_layers=num_layers,
-                            batch_first=True,
-                            bidirectional=bidirectional)
-        self.classifier = nn.Linear(hidden_dim * (2 if bidirectional else 1), num_labels)
-
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
-        x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
-        x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
-        out = self.classifier(x)  # [B, 18, num_labels]
-        return out
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.25):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-
-    def forward(self, logits, targets):
-        """
-        logits: Tensor of shape (B, num_labels)
-        targets: Tensor of shape (B, num_labels), with 0s and 1s
-        """
-        # Flatten to (B*T, C)
-        dim = logits.dim()
-        if dim == 3:
-            B, T = logits.size(0), logits.size(1)
-            logits = logits.view(-1, logits.size(-1))
-            targets = targets.view(-1, targets.size(-1))
-
-        probs = torch.sigmoid(logits)
-        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-
-        pt = probs * targets + (1 - probs) * (1 - targets)  # pt = p_t
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
-
-        return focal_loss.view(B, T, -1) if dim == 3 else focal_loss
-
-class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_pos=0, gamma_neg=4, clip=0.05, eps=1e-8):
-        """
-        gamma_pos: Focusing parameter for positive samples
-        gamma_neg: Focusing parameter for negative samples
-        clip: Optional clipping of negative prediction probabilities (to avoid overconfidence)
-        eps: Numerical stability
-        reduction: 'mean' or 'sum'
-        """
-        super().__init__()
-        self.gamma_pos = gamma_pos
-        self.gamma_neg = gamma_neg
-        self.clip = clip
-        self.eps = eps
-
-    def forward(self, logits, targets):
-        """
-        logits: raw predictions [batch_size, num_classes]
-        targets: binary labels [batch_size, num_classes]
-        """
-        # Flatten to (B*T, C)
-        dim = logits.dim()
-        if dim == 3:
-            B, T = logits.size(0), logits.size(1)
-            logits = logits.view(-1, logits.size(-1))
-            targets = targets.view(-1, targets.size(-1))
-
-        # Convert logits to probabilities
-        probs = torch.sigmoid(logits)
-        probs_pos = probs
-        probs_neg = 1 - probs
-
-        # Optional clip on negative probs to prevent over-confidence
-        if self.clip is not None and self.clip > 0:
-            probs_neg = (probs_neg + self.clip).clamp(max=1)
-
-        # Compute log-likelihood
-        log_pos = torch.log(probs_pos.clamp(min=self.eps))
-        log_neg = torch.log(probs_neg.clamp(min=self.eps))
-
-        # Asymmetric focusing
-        loss_pos = targets * (1 - probs_pos) ** self.gamma_pos * log_pos
-        loss_neg = (1 - targets) * probs_pos ** self.gamma_neg * log_neg
-
-        loss = - (loss_pos + loss_neg)
-        return loss.view(B, T, -1) if dim == 3 else loss
+from losses import AsymmetricLoss, FocalLoss
+from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageDataset, getMLCImageLoader, MultiLabelVideoDataset, getMLCVideoLoader
+from models import TimmMLCModel, TemporalMLCPredictor, TemporalMLCTCN, TemporalMLCLSTM
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -561,8 +180,8 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
-    parser.add_argument('--transformer_model', type=str, default="", help='Path to Transformer model specification')
-    parser.add_argument('--yolo_model', type=str, default="", help='Path to YOLO model specification')
+    parser.add_argument('--timm_model', type=str, required=True, help='Path to timm model specification')
+    parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
     parser.add_argument('--saved_weights', type=str, default="", help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--num_epochs', type=int, default=20, help='Total number of static training epochs')
@@ -617,29 +236,17 @@ def main():
         print(f"Logging to {args.output_file}")
 
     endo_train_mlc_data_csv = 'analysis/endo_train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/endo_train_mlc_data.csv'
-    endo_train_mlc_loader, _ = getMLCImageLoader(endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
-    endo_val_mlc_loader, _ = getMLCImageLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
-    endo_test_mlc_loader, _ = getMLCImageLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
+    endo_train_mlc_loader, _ = getMLCImageLoader(args.num_labels, endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
+    endo_val_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
+    endo_test_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
     train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/train_mlc_data.csv'
-    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
-    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
+    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(args.num_labels, train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
+    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.num_labels, 'analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 
-    num_labels = 3
-    #num_classes = 7 # irrelevant
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if len(args.transformer_model) > 0:
-        print(f"Using transformer model {args.transformer_model} as backbone")
-        if len(args.yolo_model) > 0:
-            print(f"Using yolo model {args.yolo_model} as backbone")
-            model = YoloTransformerMLCModel(num_labels, args.yolo_model, args.transformer_model).to(device)
-        else:
-            model = TransformerMLCModel(num_labels, args.transformer_model).to(device)
-    else:
-        if len(args.yolo_model) > 0:
-            print(f"Using yolo model {args.yolo_model} as backbone")
-            model = YoloSimpleMLCModel(num_labels, args.yolo_model).to(device)
-        else:
-            assert len(args.transformer_model) > 0 or len(args.yolo_model) > 0
+    assert len(args.timm_model) > 0
+    print(f"Using timm model {args.timm_model} as backbone")
+    model = TimmMLCModel(args.num_labels, args.timm_model).to(device)
     model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
         print(f"Loading model weights from {args.output_file}.static_model.pth")
@@ -668,7 +275,7 @@ def main():
         else:
             val_mlc_loaders = [cvs_val_mlc_loader]
 
-        train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
+        train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
             model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
@@ -680,8 +287,8 @@ def main():
         print(f"Using batch size {batch_size} for temporal model training")
         train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, batch_size, device)
         val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, batch_size, device)
-        #temporal_model = TemporalMLCPredictor(model.num_features, 192, num_labels).to(device)
-        temporal_model = TemporalMLCLSTM(model, 128, num_labels, 3).to(device)
+        #temporal_model = TemporalMLCPredictor(model.num_features, 192, args.num_labels).to(device)
+        temporal_model = TemporalMLCLSTM(model, 128, args.num_labels, 3).to(device)
 
         optimizer_adamw = torch.optim.AdamW([
             {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
@@ -690,7 +297,7 @@ def main():
             {'params': temporal_model.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.temporal_epochs, temporal_model, optimizer_adamw, optimizer_sgd, -1, -1, num_labels, device, [train_mlc_video], [val_mlc_video], args.output_file, ".temporal_model.pth")
+        train_loop(args.temporal_epochs, temporal_model, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, [train_mlc_video], [val_mlc_video], args.output_file, ".temporal_model.pth")
 
 if __name__ == "__main__":
     main()
