@@ -5,15 +5,10 @@ class TimmMLCModel(nn.Module):
     def __init__(self, num_labels, model_name):
         super().__init__()
         # Load pretrained model
-        #self.backbone = timm.create_model('vit_base_patch16_224.mae', pretrained=True, num_classes=0)
-        #tested models: 'swinv2_base_window12to24_192to384.ms_in22k_ft_in1k'
-        #               'vit_base_patch16_224.mae'
-        #               'mambaout_femto.in1k'
         self.backbone = timm.create_model(model_name, pretrained=True)
         self.num_features = self.backbone.feature_info[-1]['num_chs']
         self.backbone.reset_classifier(0)
         self.head = nn.Linear(self.num_features, num_labels, bias=True)
-        # Replace classifier with multilabel output (3 labels)
 
     def forward(self, x, return_hidden=False):
         feats = self.backbone(x)
@@ -34,18 +29,18 @@ class TemporalMLCPredictor(nn.Module):
         super().__init__()
         self.static_model = model
         self.projection = nn.Linear(model.num_features, hidden_dim)
-        encoder_layer = nn.TimmEncoderLayer(d_model=hidden_dim, nhead=num_heads)
-        self.timm = nn.TimmEncoder(encoder_layer, num_layers=num_layers)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.classifier = nn.Linear(hidden_dim, num_labels)
 
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+    def forward(self, x):  # x: [B, seq_len, num_labels, img_size, img_size]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
-        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1) # [B, 18, hidden_dim]
+        x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1) # [B, seq_len, hidden_dim]
         x = self.projection(x)
-        x = x.permute(1, 0, 2)  # Timm expects [seq_len, batch, hidden_dim]
-        x = self.timm(x)
-        x = x.permute(1, 0, 2)  # Back to [B, 18, hidden_dim]
-        out = self.classifier(x)  # [B, 18, num_labels]
+        x = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, hidden_dim]
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # Back to [B, seq_len, hidden_dim]
+        out = self.classifier(x)  # [B, seq_len, num_labels]
         return out
 
 class ResidualBlock(nn.Module):
@@ -75,20 +70,20 @@ class TemporalMLCTCN(nn.Module):
         ])
         self.output_proj = nn.Conv1d(hidden_dim, num_labels, kernel_size=1)
 
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+    def forward(self, x):  # x: [B, seq_len, num_labels, img_size, img_size]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
         x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
-        x = x.transpose(1, 2)         # [B, 1536, 18] → [B, C, T]
-        x = self.input_proj(x)        # [B, hidden_dim, 18]
+        x = x.transpose(1, 2)         # [B, 1536, seq_len] → [B, C, T]
+        x = self.input_proj(x)        # [B, hidden_dim, seq_len]
         x = self.blocks(x)            # temporal modeling
-        x = self.output_proj(x)      # [B, 3, 18]
-        x = x.transpose(1, 2)         # [B, 18, 3]
+        x = self.output_proj(x)      # [B, num_labels, seq_len]
+        x = x.transpose(1, 2)         # [B, seq_len, 3]
         return x
 
 class TemporalMLCLSTM(nn.Module):
-    def __init__(self, timm_model, hidden_dim=256, num_labels=3, num_layers=1, bidirectional=False):
+    def __init__(self, model, hidden_dim, num_labels, num_layers, bidirectional=False):
         super().__init__()
-        self.timm_model = model
+        self.static_model = model
         self.lstm = nn.LSTM(input_size=model.num_features,
                             hidden_size=hidden_dim,
                             num_layers=num_layers,
@@ -96,9 +91,9 @@ class TemporalMLCLSTM(nn.Module):
                             bidirectional=bidirectional)
         self.classifier = nn.Linear(hidden_dim * (2 if bidirectional else 1), num_labels)
 
-    def forward(self, x):  # x: [B, 18, 3, 384, 384]
+    def forward(self, x):  # x: [B, seq_len, num_labels, img_size, img_size]
         x_reshaped = x.view(-1, x.size(-3), x.size(-2), x.size(-1))
         x = self.static_model(x_reshaped, return_hidden=True).view(x.size(0), x.size(1), -1)
-        x, _ = self.lstm(x)  # output: [B, 18, hidden_dim*2]
-        out = self.classifier(x)  # [B, 18, num_labels]
+        x, _ = self.lstm(x)  # output: [B, seq_len, hidden_dim*2]
+        out = self.classifier(x)  # [B, seq_len, num_labels]
         return out
