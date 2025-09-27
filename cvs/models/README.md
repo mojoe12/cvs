@@ -22,8 +22,8 @@ results/
 ### Empty
 
 ```
-python test.py --num_labels 3 --input_dir data/frames/ --input_json data/metadata/test_frames_AB.json --timm_model swinv2_base_window12to24_192to384.ms_in22k_ft_in1k --image_size 384 --saved_weights large_model_weights.temporal_model.pth --mlc_batch_size 2 --output_json results/subchallengeA.json
+python test.py --num_labels 3 --input_dir data/frames/ --input_json data/metadata/test_frames_AB.json --timm_model swinv2_base_window12to24_192to384.ms_in22k_ft_in1k --image_size 384 --saved_weights large_model_weights.temporal_model.pth --batch_size 2 --output_json results/subchallengeA.json
 
-python test.py --num_labels 3 --input_dir data/frames/ --input_json data/metadata/test_frames_AB.json --timm_model swinv2_base_window12_192.ms_in22k --image_size 192 --saved_weights small_model_weights.temporal_model.pth --mlc_batch_size 1 --output_json results/subchallengeB.json
+python test.py --num_labels 3 --input_dir data/frames/ --input_json data/metadata/test_frames_AB.json --timm_model swinv2_base_window12_192.ms_in22k --image_size 192 --saved_weights small_model_weights.temporal_model.pth --batch_size 1 --output_json results/subchallengeB.json
 
 ```
