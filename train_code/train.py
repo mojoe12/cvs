@@ -69,22 +69,45 @@ def cutmix_data(x, y, alpha=1.0):
     y_a, y_b = y, y[index]
     return x, y_a, y_b, lam
 
-def trainStep(model, dataloader, criterion, optimizer, device, max_norm):
+def trainStep(model, teacher_model, student_image_size, dataloader, criterion, optimizer, device, max_norm):
     model.train()
     total_loss = 0
-    for images, labels, confidences in dataloader:
-        images = images.to(device)
+    for timages, labels, confidences in dataloader:
+        timages = timages.to(device)
         labels = labels.to(device)
         confidences = confidences.to(device)
         # Apply MixUp or CutMix
         if random.random() < 0.5:
-            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=0.4)
+            timages, targets_a, targets_b, lam = mixup_data(timages, labels, alpha=0.4)
         else:
-            images, targets_a, targets_b, lam = cutmix_data(images, labels, alpha=0.4)
+            timages, targets_a, targets_b, lam = cutmix_data(timages, labels, alpha=0.4)
+
+        if teacher_model:
+            images = F.interpolate(timages, size=(student_image_size, student_image_size), mode='bilinear', align_corners=False)
+
+            with torch.no_grad():
+                teacher_outputs = teacher_model(timages)
+        else:
+            images = timages
+
         optimizer.zero_grad()
         outputs = model(images)
+
+        # Hard loss
         loss_raw = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
         loss = (loss_raw * confidences).mean()
+
+        if teacher_model:
+            # Soft loss
+            temperature = 4.0
+            soft_loss = F.kl_div(
+                F.log_softmax(outputs / temperature, dim=1),
+                F.softmax(teacher_outputs / temperature, dim=1),
+                reduction="batchmean"
+            ) * (temperature ** 2)
+
+            loss = 5 * soft_loss + 0.5 * loss
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
         optimizer.step()
@@ -117,7 +140,7 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
                 assert False # outputs dim should be 2 or 3
     return total_loss / len(dataloader)
 
-def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, output_file, output_file_ext):
+def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, output_file, output_file_ext):
     # ---- Optimizer and Loss ----
     criterion = AsymmetricLoss(gamma_pos=0, gamma_neg=4, clip=0.05)
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
@@ -153,7 +176,7 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_mlc_loader in enumerate(train_mlc_loaders):
-            train_loss = trainStep(model, train_mlc_loader, criterion, optimizer, device, max_norm)
+            train_loss = trainStep(model, teacher_model, student_image_size, train_mlc_loader, criterion, optimizer, device, max_norm)
             print(f"Dataset {d} CVS Classification Train Loss: {train_loss:.4f}")
 
         for d, val_mlc_loader in enumerate(val_mlc_loaders):
@@ -177,19 +200,29 @@ def train_loop(num_epochs, model, optimizer_adamw, optimizer_sgd, sgd_epoch, unf
         torch.save(model.state_dict(), output_file + output_file_ext)
         print(f"Model weights exported to: {output_file + output_file_ext}")
 
+def parse_string_pairs(s):
+    """Helper function to parse a string like 'key:value' into a tuple"""
+    try:
+        key, value = s.split(':', 1)  # Split on first colon only
+        return (key, value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Pair must be in 'key:value' format, got '{s}'")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
     parser.add_argument('--timm_model', type=str, required=True, help='Path to timm model specification')
+    parser.add_argument('--teacher_model', type=str, required=True, help='Path to Timm model specification for teacher model')
     parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
-    parser.add_argument('--saved_weights', type=str, default="", help='Path to file representing model weights')
+    parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
-    parser.add_argument('--num_epochs', type=int, default=20, help='Total number of static training epochs')
+    parser.add_argument('--teacher_image_size', type=int, required=False, help='Image Size for teacher. Depends on model')
+    parser.add_argument('--num_epochs', type=int, required=True, help='Total number of static training epochs')
     parser.add_argument('--temporal_epochs', type=int, default=0, help='Total number of temporal training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
     parser.add_argument('--unfreeze_epoch', type=int, default=0, help='Epoch at which to unfreeze the backbone')
 
-    parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
+    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
 
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
@@ -200,10 +233,6 @@ def parse_args():
     parser.add_argument('--backbone_weight_decay', type=float, default=5e-4, help='Base weight decay')
     parser.add_argument('--classifier_weight_decay', type=float, default=5e-4, help='Classifier weight decay')
 
-    parser.add_argument('--use_endoscapes', action='store_true', help='Add in samples from endoscapes cvs 201')
-    parser.add_argument('--only_endoscapes', action='store_true', help='Train and validate on endoscapes only')
-    parser.add_argument('--use_interpolated', action='store_true', help='Add in interpolated training samples')
-
     parser.add_argument('--output_file', type=str, default="", help='Path to model specification')
 
     return parser.parse_args()
@@ -211,42 +240,52 @@ def parse_args():
 def main():
 
     args = parse_args()
-    height, width = args.image_size, args.image_size
+    if len(args.teacher_model) > 0:
+        height, width = args.teacher_image_size, args.teacher_image_size
+    else:
+        height, width = args.image_size, args.image_size
     print(f"Num epochs for per-frame training: {args.num_epochs}")
     print(f"Num epochs for per-video training: {args.temporal_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
     if args.unfreeze_epoch > 0:
         print(f"Unfreeze backbone at: {args.unfreeze_epoch}")
-    print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
+    print(f"Batch size: {args.batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr})")
     if args.sgd_epoch >= 0:
         print(f"SGD (backbone={args.backbone_sgd_lr}, clf={args.classifier_sgd_lr})")
     print(f"Weight decay: backbone={args.backbone_weight_decay}, clf={args.classifier_weight_decay}")
-    if args.use_endoscapes:
-        print("Using endoscapes cvs 201 for additional training data")
-    if args.only_endoscapes:
-        print("Training and validating only on endoscapes")
-    assert not args.use_endoscapes or not args.only_endoscapes
-
-    if args.use_interpolated:
-        print("Using interpolated training data")
     if len(args.output_file) > 0:
         assert ".pth" not in args.output_file # library will add that
-        print(f"Logging to {args.output_file}")
+        print(f"Logging model to {args.output_file}")
 
-    endo_train_mlc_data_csv = 'analysis/endo_train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/endo_train_mlc_data.csv'
-    endo_train_mlc_loader, _ = getMLCImageLoader(args.num_labels, endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
-    endo_val_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
-    endo_test_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
-    train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/train_mlc_data.csv'
-    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(args.num_labels, train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
-    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.num_labels, 'analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
+    train_mlc_loaders, val_mlc_loaders, train_mlc_datasets, val_mlc_datasets = [], [], [], []
+    for train_csv, train_dir in args.training_data:
+        mlc_loader, mlc_dataset = getMLCImageLoader(args.num_labels, train_csv, train_dir, True, height, width, args.batch_size)
+        train_mlc_loaders.append(mlc_loader)
+        train_mlc_datasets.append(mlc_dataset)
+
+    for val_csv, val_dir in args.validation_data:
+        mlc_loader, mlc_dataset = getMLCImageLoader(args.num_labels, val_csv, val_dir, False, height, width, args.batch_size)
+        val_mlc_loaders.append(mlc_loader)
+        val_mlc_dataset.append(mlc_dataset)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if len(args.teacher_model) > 0:
+        teacher_model = TimmMLCModel(args.num_labels, args.teacher_model).to(device)
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        assert len(args.saved_weights) > 0
+        print(f"Loading model weights from {args.saved_weights}")
+        teacher_model.load_state_dict(torch.load(args.saved_weights, map_location=device))
+        assert args.num_epochs > 0
+    else:
+        teacher_model = None
+
     assert len(args.timm_model) > 0
     print(f"Using timm model {args.timm_model} as backbone")
     model = TimmMLCModel(args.num_labels, args.timm_model).to(device)
+ 
     model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
         print(f"Loading model weights from {args.output_file}.static_model.pth")
@@ -264,18 +303,7 @@ def main():
             {'params': model.classifier_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        if args.use_endoscapes:
-            train_mlc_loaders = [cvs_train_mlc_loader, endo_train_mlc_loader, endo_val_mlc_loader, endo_test_mlc_loader]
-        elif args.only_endoscapes:
-            train_mlc_loaders = [endo_train_mlc_loader]
-        else:
-            train_mlc_loaders = [cvs_train_mlc_loader]
-        if args.only_endoscapes:
-            val_mlc_loaders = [endo_val_mlc_loader, endo_test_mlc_loader]
-        else:
-            val_mlc_loaders = [cvs_val_mlc_loader]
-
-        train_loop(args.num_epochs, model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
+        train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
             model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
@@ -283,10 +311,13 @@ def main():
     if args.temporal_epochs > 0:
         model.set_backbone(False)
         # eval the hidden weights first
-        batch_size = max(2, args.mlc_batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
+        batch_size = max(2, args.batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
         print(f"Using batch size {batch_size} for temporal model training")
-        train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, batch_size, device)
-        val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, batch_size, device)
+        train_mlc_video_loaders, val_mlc_video_loaders = [], []
+        for mlc_datset in train_mlc_datasets:
+            train_mlc_videos.append(getMLCVideoLoader(mlc_dataset, batch_size, device))
+        for mlc_dataset in val_mlc_datasets:
+            val_mlc_videos.append(getMLCVideoLoader(mlc_dataset, batch_size, device))
         #temporal_model = TemporalMLCPredictor(model.num_features, 192, args.num_labels).to(device)
         temporal_model = TemporalMLCLSTM(model, 128, args.num_labels, 3).to(device)
 
@@ -297,7 +328,7 @@ def main():
             {'params': temporal_model.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.temporal_epochs, temporal_model, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, [train_mlc_video], [val_mlc_video], args.output_file, ".temporal_model.pth")
+        train_loop(args.temporal_epochs, temporal_model, None, None, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, train_mlc_video_loaders, val_mlc_video_loaders, args.output_file, ".temporal_model.pth")
 
 if __name__ == "__main__":
     main()

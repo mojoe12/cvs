@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
     parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
-    parser.add_argument('--mlc_batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
+    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to input frames')
     parser.add_argument('--input_json', type=str, required=True, help='Path to input json listing useful frames')
@@ -58,8 +58,8 @@ def parse_args():
 def main():
     args = parse_args()
     height, width = args.image_size, args.image_size
-    print(f"Batch size: {args.mlc_batch_size}, Image size: {height}x{width}")
-    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.input_dir, args.input_json, height, width, args.mlc_batch_size)
+    print(f"Batch size: {args.batch_size}, Image size: {height}x{width}")
+    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.input_dir, args.input_json, height, width, args.batch_size)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
     assert len(args.timm_model) > 0
@@ -71,7 +71,7 @@ def main():
     print(f"Loading model weights from {args.saved_weights}")
     temporal_model.load_state_dict(torch.load(args.saved_weights, map_location=device))
 
-    val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, args.mlc_batch_size, device)
+    val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, args.batch_size, device)
     evalModel(temporal_model, val_mlc_video, device, args.output_json)
 
 if __name__ == "__main__":
