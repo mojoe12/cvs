@@ -69,20 +69,26 @@ class MultiLabelImageDataset(Dataset):
         label, confidence = self.data[filename]
         label = torch.tensor(label, dtype=torch.float32)
         confidence = torch.tensor(confidence, dtype=torch.float32)
-        #confidence = confidence * torch.tensor([3.19852941, 4.46153846, 2.79518072], dtype=torch.float32)
 
         return image, label, confidence
 
-def getMLCImageLoader(csv_file, image_path, augment, h, w, batch_size):
+def getMLCImageLoader(num_labels, csv_file, image_path, augment, h, w, batch_size):
     # Transforms
     my_df = pd.read_csv(csv_file)
-    labels_confidences_dict = {
-        row['image']: (
-            [row['c1'], row['c2'], row['c3']],
-            [row['weight_c1'], row['weight_c2'], row['weight_c3']]
-        )
-        for _, row in my_df.iterrows()
-    }
+    labels_confidences_dict = {}
+
+    for _, row in my_df.iterrows():
+        # Dynamically create lists of labels and weights based on num_labels
+        labels = [row[f'c{i+1}'] for i in range(num_labels)]
+
+        # Check if weight columns exist, default to 1 if not
+        weights = []
+        for i in range(num_labels):
+            col_name = f'weight_c{i+1}'
+            weight = row[col_name] if col_name in row and pd.notna(row[col_name]) else 1.0
+            weights.append(weight)
+
+        labels_confidences_dict[row['image']] = (labels, weights)
 
     # Create dataset instance
     dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment, pad_and_not_crop=False)

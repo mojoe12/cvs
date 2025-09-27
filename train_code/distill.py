@@ -202,6 +202,7 @@ def parse_args():
 
     parser.add_argument('--teacher_model', type=str, required=True, help='Path to Timm model specification')
     parser.add_argument('--student_model', type=str, required=True, help='Path to Timm model specification')
+    parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
     parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
     parser.add_argument('--teacher_image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--student_image_size', type=int, required=True, help='Image Size. Depends on model')
@@ -257,24 +258,22 @@ def main():
         print(f"Logging to {args.output_file}")
 
     endo_train_mlc_data_csv = 'analysis/endo_train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/endo_train_mlc_data.csv'
-    endo_train_mlc_loader, _ = getMLCImageLoader(endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
-    endo_val_mlc_loader, _ = getMLCImageLoader('analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
-    endo_test_mlc_loader, _ = getMLCImageLoader('analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
+    endo_train_mlc_loader, _ = getMLCImageLoader(args.num_labels, endo_train_mlc_data_csv, 'endoscapes/train', True, height, width, args.mlc_batch_size)
+    endo_val_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_val_mlc_data.csv', 'endoscapes/val', args.use_endoscapes, height, width, args.mlc_batch_size)
+    endo_test_mlc_loader, _ = getMLCImageLoader(args.num_labels, 'analysis/endo_test_mlc_data.csv', 'endoscapes/test', args.use_endoscapes, height, width, args.mlc_batch_size)
     train_mlc_data_csv = 'analysis/train_mlc_data_interpolated.csv' if args.use_interpolated else 'analysis/train_mlc_data.csv'
-    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
-    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader('analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
+    cvs_train_mlc_loader, cvs_train_mlc_dataset = getMLCImageLoader(args.num_labels, train_mlc_data_csv, 'sages_cvs_challenge_2025/frames', True, height, width, args.mlc_batch_size)
+    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.nunm_labels, 'analysis/val_mlc_data.csv', 'sages_cvs_challenge_2025/frames', False, height, width, args.mlc_batch_size)
 
-    num_labels = 3
-    #num_classes = 7 # irrelevant
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    teacher_model = TimmMLCModel(num_labels, args.teacher_model).to(device)
+    teacher_model = TimmMLCModel(args.num_labels, args.teacher_model).to(device)
     for param in teacher_model.parameters():
         param.requires_grad = False
     assert len(args.saved_weights) > 0
     print(f"Loading model weights from {args.saved_weights}")
     teacher_model.load_state_dict(torch.load(args.saved_weights, map_location=device))
     assert args.num_epochs > 0
-    model = TimmMLCModel(num_labels, args.student_model).to(device)
+    model = TimmMLCModel(args.num_labels, args.student_model).to(device)
     model.set_backbone(args.unfreeze_epoch == 0)
 
     if args.num_epochs > 0:
@@ -298,7 +297,7 @@ def main():
         else:
             val_mlc_loaders = [cvs_val_mlc_loader]
 
-        train_loop(args.num_epochs, model, teacher_model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
+        train_loop(args.num_epochs, model, teacher_model, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
             model.load_state_dict(torch.load(args.output_file + ".static_model.pth", map_location=device))
@@ -310,8 +309,8 @@ def main():
         print(f"Using batch size {batch_size} for temporal model training")
         train_mlc_video = getMLCVideoLoader(cvs_train_mlc_dataset, batch_size, device)
         val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, batch_size, device)
-        #temporal_model = TemporalMLCPredictor(model.num_features, 192, num_labels).to(device)
-        temporal_model = TemporalMLCLSTM(model, 128, num_labels, 3).to(device)
+        #temporal_model = TemporalMLCPredictor(model.num_features, 192, args.num_labels).to(device)
+        temporal_model = TemporalMLCLSTM(model, 128, args.num_labels, 3).to(device)
 
         optimizer_adamw = torch.optim.AdamW([
             {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
@@ -320,7 +319,7 @@ def main():
             {'params': temporal_model.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.temporal_epochs, temporal_model, optimizer_adamw, optimizer_sgd, -1, -1, num_labels, device, [train_mlc_video], [val_mlc_video], args.output_file, ".temporal_model.pth")
+        train_loop(args.temporal_epochs, temporal_model, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, [train_mlc_video], [val_mlc_video], args.output_file, ".temporal_model.pth")
 
 if __name__ == "__main__":
     main()
