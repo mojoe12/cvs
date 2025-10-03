@@ -5,8 +5,8 @@ import argparse
 import json
 import time
 from losses import AsymmetricLoss, FocalLoss
-from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageDataset, getMLCImageLoader, MultiLabelVideoDataset, getMLCVideoLoader
-from models import TimmMLCModel, TemporalMLCPredictor, TemporalMLCTCN, TemporalMLCLSTM
+from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageTestingDataset, getImageTestingLoader, MultiLabelVideoDataset, getVideoLoader
+from models import TimmModel, TemporalPredictor, TemporalTCN, TemporalLSTM
 
 def evalModel(model, dataloader, device, output_file):
     model.eval()
@@ -59,20 +59,20 @@ def main():
     args = parse_args()
     height, width = args.image_size, args.image_size
     print(f"Batch size: {args.batch_size}, Image size: {height}x{width}")
-    cvs_val_mlc_loader, cvs_val_mlc_dataset = getMLCImageLoader(args.input_dir, args.input_json, height, width, args.batch_size)
+    val_loader, val_dataset = getImageTestingLoader(args.input_dir, args.input_json, height, width, args.batch_size)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
     assert len(args.timm_model) > 0
     print(f"Using timm model {args.timm_model} as backbone")
-    model = TimmMLCModel(args.num_labels, args.timm_model).to(device)
+    model = TimmModel(args.num_labels, args.timm_model).to(device)
     model.set_backbone(False)
-    temporal_model = TemporalMLCLSTM(model, 128, args.num_labels, 3).to(device)
+    temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
     assert len(args.saved_weights) > 0
     print(f"Loading model weights from {args.saved_weights}")
     temporal_model.load_state_dict(torch.load(args.saved_weights, map_location=device))
 
-    val_mlc_video = getMLCVideoLoader(cvs_val_mlc_dataset, args.batch_size, device)
-    evalModel(temporal_model, val_mlc_video, device, args.output_json)
+    val_video_loader = getVideoLoader(val_dataset, args.batch_size, device, True)
+    evalModel(temporal_model, val_video_loader, device, args.output_json)
 
 if __name__ == "__main__":
     print(os.cpu_count())

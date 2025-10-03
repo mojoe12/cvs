@@ -8,8 +8,8 @@ import numpy as np
 import random
 import argparse
 from losses import AsymmetricLoss, FocalLoss
-from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageDataset, getMLCImageLoader, MultiLabelVideoDataset, getMLCVideoLoader
-from models import TimmMLCModel, TemporalMLCPredictor, TemporalMLCTCN, TemporalMLCLSTM
+from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageTrainingDataset, getImageTrainingLoader, MultiLabelVideoDataset, getVideoLoader
+from models import TimmModel, TemporalPredictor, TemporalTCN, TemporalLSTM
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -114,7 +114,7 @@ def trainStep(model, teacher_model, student_image_size, dataloader, criterion, o
         total_loss += loss.item()
     return total_loss / len(dataloader)
 
-def validateMLCStep(model, dataloader, criterion, device, precision):
+def validateStep(model, dataloader, criterion, device, precision):
     model.eval()
     total_loss = 0
     all_probs = []
@@ -140,7 +140,7 @@ def validateMLCStep(model, dataloader, criterion, device, precision):
                 assert False # outputs dim should be 2 or 3
     return total_loss / len(dataloader)
 
-def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_mlc_loaders, val_mlc_loaders, output_file, output_file_ext):
+def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_loaders, val_loaders, output_file, output_file_ext):
     # ---- Optimizer and Loss ----
     criterion = AsymmetricLoss(gamma_pos=0, gamma_neg=4, clip=0.05)
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
@@ -175,28 +175,28 @@ def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_a
             print("Unfroze backbone")
 
         print(f"Epoch {epoch+1}/{num_epochs}")
-        for d, train_mlc_loader in enumerate(train_mlc_loaders):
-            train_loss = trainStep(model, teacher_model, student_image_size, train_mlc_loader, criterion, optimizer, device, max_norm)
+        for d, train_loader in enumerate(train_loaders):
+            train_loss = trainStep(model, teacher_model, student_image_size, train_loader, criterion, optimizer, device, max_norm)
             print(f"Dataset {d} CVS Classification Train Loss: {train_loss:.4f}")
 
-        for d, val_mlc_loader in enumerate(val_mlc_loaders):
+        for d, val_loader in enumerate(val_loaders):
             precision.reset()
-            val_mlc_loss = validateMLCStep(model, val_mlc_loader, criterion, device, precision)
+            val_loss = validateStep(model, val_loader, criterion, device, precision)
             map_score = precision.compute().cpu() # Tensor of size [num_labels] or scalar if average="macro"
-            print(f"Dataset {d} CVS Classification Validation Loss: {val_mlc_loss:.4f}, Average Precision is {map_score.mean():.4f}: {map_score}")
+            print(f"Dataset {d} CVS Classification Validation Loss: {val_loss:.4f}, Average Precision is {map_score.mean():.4f}: {map_score}")
 
             if d == 0 and map_score.mean() > best_avg_precision and len(output_file) > 0:
                 best_avg_precision = map_score.mean()
                 torch.save(model.state_dict(), output_file + output_file_ext)
                 print(f"Model improved. Weights saved to: {output_file + output_file_ext}")
 
-        if len(val_mlc_loaders) > 0:
+        if len(val_loaders) > 0:
             if epoch >= sgd_epoch and sgd_epoch > -1:
-                scheduler_sgd.step(val_mlc_loss)
+                scheduler_sgd.step(val_loss)
             else:
                 scheduler_adamw.step()
 
-    if len(val_mlc_loaders) == 0 and len(output_file) > 0:
+    if len(val_loaders) == 0 and len(output_file) > 0:
         torch.save(model.state_dict(), output_file + output_file_ext)
         print(f"Model weights exported to: {output_file + output_file_ext}")
 
@@ -259,20 +259,20 @@ def main():
         assert ".pth" not in args.output_file # library will add that
         print(f"Logging model to {args.output_file}")
 
-    train_mlc_loaders, val_mlc_loaders, train_mlc_datasets, val_mlc_datasets = [], [], [], []
+    train_loaders, val_loaders, train_datasets, val_datasets = [], [], [], []
     for train_csv, train_dir in args.training_data:
-        mlc_loader, mlc_dataset = getMLCImageLoader(args.num_labels, train_csv, train_dir, True, height, width, args.batch_size)
-        train_mlc_loaders.append(mlc_loader)
-        train_mlc_datasets.append(mlc_dataset)
+        loader, dataset = getImageTrainingLoader(args.num_labels, train_csv, train_dir, True, height, width, args.batch_size)
+        train_loaders.append(loader)
+        train_datasets.append(dataset)
 
     for val_csv, val_dir in args.validation_data:
-        mlc_loader, mlc_dataset = getMLCImageLoader(args.num_labels, val_csv, val_dir, False, height, width, args.batch_size)
-        val_mlc_loaders.append(mlc_loader)
-        val_mlc_dataset.append(mlc_dataset)
+        loader, dataset = getImageTrainingLoader(args.num_labels, val_csv, val_dir, False, height, width, args.batch_size)
+        val_loaders.append(loader)
+        val_dataset.append(dataset)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if len(args.teacher_model) > 0:
-        teacher_model = TimmMLCModel(args.num_labels, args.teacher_model).to(device)
+        teacher_model = TimmModel(args.num_labels, args.teacher_model).to(device)
         for param in teacher_model.parameters():
             param.requires_grad = False
         assert len(args.saved_weights) > 0
@@ -284,7 +284,7 @@ def main():
 
     assert len(args.timm_model) > 0
     print(f"Using timm model {args.timm_model} as backbone")
-    model = TimmMLCModel(args.num_labels, args.timm_model).to(device)
+    model = TimmModel(args.num_labels, args.timm_model).to(device)
  
     model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
@@ -303,7 +303,7 @@ def main():
             {'params': model.classifier_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_mlc_loaders, val_mlc_loaders, args.output_file, ".static_model.pth")
+        train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_loaders, val_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
             model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
@@ -313,13 +313,13 @@ def main():
         # eval the hidden weights first
         batch_size = max(2, args.batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
         print(f"Using batch size {batch_size} for temporal model training")
-        train_mlc_video_loaders, val_mlc_video_loaders = [], []
-        for mlc_datset in train_mlc_datasets:
-            train_mlc_videos.append(getMLCVideoLoader(mlc_dataset, batch_size, device))
-        for mlc_dataset in val_mlc_datasets:
-            val_mlc_videos.append(getMLCVideoLoader(mlc_dataset, batch_size, device))
-        #temporal_model = TemporalMLCPredictor(model.num_features, 192, args.num_labels).to(device)
-        temporal_model = TemporalMLCLSTM(model, 128, args.num_labels, 3).to(device)
+        train_video_loaders, val_video_loaders = [], []
+        for datset in train_datasets:
+            train_videos.append(getVideoLoader(dataset, batch_size, device, False))
+        for dataset in val_datasets:
+            val_videos.append(getVideoLoader(dataset, batch_size, device, False))
+        #temporal_model = TemporalPredictor(model.num_features, 192, args.num_labels).to(device)
+        temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
 
         optimizer_adamw = torch.optim.AdamW([
             {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
@@ -328,7 +328,7 @@ def main():
             {'params': temporal_model.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.temporal_epochs, temporal_model, None, None, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, train_mlc_video_loaders, val_mlc_video_loaders, args.output_file, ".temporal_model.pth")
+        train_loop(args.temporal_epochs, temporal_model, None, None, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, train_video_loaders, val_video_loaders, args.output_file, ".temporal_model.pth")
 
 if __name__ == "__main__":
     main()
