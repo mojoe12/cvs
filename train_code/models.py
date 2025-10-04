@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import timm
 
-class TimmMLCModel(nn.Module):
+class TimmModel(nn.Module):
     def __init__(self, num_labels, model_name):
         super().__init__()
         # Load pretrained model
@@ -24,7 +25,7 @@ class TimmMLCModel(nn.Module):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
 
-class TemporalMLCPredictor(nn.Module):
+class TemporalPredictor(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_layers=2, num_heads=4):
         super().__init__()
         self.static_model = model
@@ -60,7 +61,7 @@ class ResidualBlock(nn.Module):
         x += residual  # Residual connection
         return x
 
-class TemporalMLCTCN(nn.Module):
+class TemporalTCN(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_blocks):
         super().__init__()
         self.static_model = model
@@ -80,7 +81,7 @@ class TemporalMLCTCN(nn.Module):
         x = x.transpose(1, 2)         # [B, seq_len, 3]
         return x
 
-class TemporalMLCLSTM(nn.Module):
+class TemporalLSTM(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_layers, bidirectional=False):
         super().__init__()
         self.static_model = model

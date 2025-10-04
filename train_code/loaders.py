@@ -8,6 +8,7 @@ from PIL import Image
 import os
 import pandas as pd
 import random
+import json
 
 class PadToSquareHeight:
     def __call__(self, img):
@@ -25,7 +26,7 @@ class CropToSquareHeight:
             return img  # already tall or square
         return transforms.CenterCrop(h)(img)
 
-class MultiLabelImageDataset(Dataset):
+class MultiLabelImageTrainingDataset(Dataset):
     def __init__(self, image_dir, labels_and_confidences, height, width, augment, pad_and_not_crop):
         # labels_and_confidences = {filename: ([0, 1, 1], [1.0, 0.6, 0.9])}
         self.image_dir = image_dir
@@ -72,7 +73,7 @@ class MultiLabelImageDataset(Dataset):
 
         return image, label, confidence
 
-def getMLCImageLoader(num_labels, csv_file, image_path, augment, h, w, batch_size):
+def getImageTrainingLoader(num_labels, csv_file, image_path, augment, h, w, batch_size):
     # Transforms
     my_df = pd.read_csv(csv_file)
     labels_confidences_dict = {}
@@ -91,7 +92,7 @@ def getMLCImageLoader(num_labels, csv_file, image_path, augment, h, w, batch_siz
         labels_confidences_dict[row['image']] = (labels, weights)
 
     # Create dataset instance
-    dataset = MultiLabelImageDataset(image_path, labels_confidences_dict, h, w, augment, pad_and_not_crop=False)
+    dataset = MultiLabelImageTrainingDataset(image_path, labels_confidences_dict, h, w, augment, pad_and_not_crop=False)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -100,24 +101,72 @@ def getMLCImageLoader(num_labels, csv_file, image_path, augment, h, w, batch_siz
     )
     return loader, dataset
 
+class MultiLabelImageTestingDataset(Dataset):
+    def __init__(self, image_dir, image_json, height, width, pad_and_not_crop):
+        self.image_dir = image_dir
+
+        with open(image_json, 'r') as f:
+            data = json.load(f)
+
+        self.image_filenames = [img["file_name"] for img in data["images"]]
+        square_transform = PadToSquareHeight() if pad_and_not_crop else CropToSquareHeight()
+        self.transform = transforms.Compose([
+            square_transform,
+            transforms.Resize((height, width)),
+            transforms.ToTensor()
+        ])
+
+    def getFilenames(self):
+        return self.image_filenames
+
+    def __len__(self):
+        return len(self.image_filenames)
+
+    def __getitem__(self, idx):
+        filename = self.image_filenames[idx]
+        image_path = os.path.join(self.image_dir, filename)
+        image = Image.open(image_path).convert('RGB')
+        image = self.transform(image)
+        return image, filename
+
+def getImageTestingLoader(image_path, image_json, h, w, batch_size):
+    # Create dataset instance
+    dataset = MultiLabelImageTestingDataset(image_path, image_json, h, w, pad_and_not_crop=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2
+    )
+    return loader, dataset
+
 class MultiLabelVideoDataset(Dataset):
-    def __init__(self, image_dataset, video_indices):
+    def __init__(self, image_dataset, video_indices, testing):
         self.image_dataset = image_dataset
         self.video_indices = video_indices
+        self.testing = testing
 
     def __len__(self):
         return len(self.video_indices)
 
     def __getitem__(self, idx):
-        video_images, video_labels, video_confidences = [], [], []
-        for index in self.video_indices[idx]:
-            image, label, confidence = self.image_dataset[index]
-            video_images.append(image)
-            video_labels.append(label)
-            video_confidences.append(confidence)
-        return torch.stack(video_images), torch.stack(video_labels), torch.stack(video_confidences)
+        if not self.testing:
+            video_images, video_labels, video_confidences = [], [], []
+            for index in self.video_indices[idx]:
+                image, label, confidence = self.image_dataset[index]
+                video_images.append(image)
+                video_labels.append(label)
+                video_confidences.append(confidence)
+            return torch.stack(video_images), torch.stack(video_labels), torch.stack(video_confidences)
+        else:
+            video_images, video_filenames = [], []
+            for index in self.video_indices[idx]:
+                image, filename = self.image_dataset[index]
+                video_images.append(image)
+                video_filenames.append(filename)
+            return torch.stack(video_images), video_filenames
 
-def getMLCVideoLoader(image_dataset, batch_size, device):
+def getVideoLoader(image_dataset, batch_size, device, testing):
     image_filenames = image_dataset.getFilenames()
     video_frames = {}
     for index, filename in enumerate(image_filenames):
@@ -132,7 +181,7 @@ def getMLCVideoLoader(image_dataset, batch_size, device):
         video_indices.append(list(frames.values()))
 
     # Create dataset instance
-    dataset = MultiLabelVideoDataset(image_dataset, video_indices)
+    dataset = MultiLabelVideoDataset(image_dataset, video_indices, testing)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -140,4 +189,5 @@ def getMLCVideoLoader(image_dataset, batch_size, device):
         num_workers=4
     )
     return loader
+
 
