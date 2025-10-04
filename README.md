@@ -1,7 +1,7 @@
 # cvs
 
-Before execoding the code below, ensure (1) `python` exists on your system, and (2) Git LFS is installed (via `git lfs install`).
-Depending on your system's Python installation, you may need to rename `python` to `python3` in the code below.
+Before executing the code below, ensure (1) `python` exists on your system (try `which python`), and (2) Git LFS is installed (via `git lfs install`).
+Depending on your system's Python installation, you may need to rename `python` to `python3` in the command-line prompts below.
 
 ## Running an initial test:
 ```
