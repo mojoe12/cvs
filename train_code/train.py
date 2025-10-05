@@ -231,9 +231,8 @@ def parse_args():
         help='List of csv:directory pairs (e.g., --validation_data data/val_mlc_data.csv:data/frames/ )'
     )
 
-    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
-                        help='Batch size for multi-label classification')
-
+    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1, help='Batch size for frame-wise training')
+    parser.add_argument('--temporal_batch_size', type=int, default=2, help='Batch size for video-wise training')
     parser.add_argument('--temporal_model', type=str, default="lstm", help='How to map frame-wise features to video features')
 
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
@@ -324,13 +323,12 @@ def main():
     if args.temporal_epochs > 0:
         model.set_backbone(False)
         # eval the hidden weights first
-        batch_size = max(2, args.batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
-        print(f"Using batch size {batch_size} for temporal model training")
+        print(f"Using batch size {args.temporal_batch_size} for temporal model training")
         train_video_loaders, val_video_loaders = [], []
         for datset in train_datasets:
-            train_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
+            train_video_loaders.append(getVideoLoader(dataset, args.temporal_batch_size, device, False))
         for dataset in val_datasets:
-            val_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
+            val_video_loaders.append(getVideoLoader(dataset, args.temporal_batch_size, device, False))
 
         if args.temporal_model == "lstm":
             temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
