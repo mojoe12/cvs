@@ -212,15 +212,24 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
     parser.add_argument('--timm_model', type=str, required=True, help='Path to timm model specification')
-    parser.add_argument('--teacher_model', type=str, required=True, help='Path to Timm model specification for teacher model')
+    parser.add_argument('--teacher_model', type=str, default="", help='Path to timm model specification for teacher model')
     parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
-    parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
+    parser.add_argument('--saved_weights', type=str, default="", help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--teacher_image_size', type=int, required=False, help='Image Size for teacher. Depends on model')
     parser.add_argument('--num_epochs', type=int, required=True, help='Total number of static training epochs')
     parser.add_argument('--temporal_epochs', type=int, default=0, help='Total number of temporal training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
     parser.add_argument('--unfreeze_epoch', type=int, default=0, help='Epoch at which to unfreeze the backbone')
+
+    parser.add_argument(
+        '--training_data', type=parse_string_pairs, nargs='+', required=True,
+        help='List of csv:directory pairs (e.g., --training_data data/train_mlc_data.csv:data/frames/ )'
+    )
+    parser.add_argument(
+        '--validation_data', type=parse_string_pairs, nargs='+', required=True,
+        help='List of csv:directory pairs (e.g., --validation_data data/val_mlc_data.csv:data/frames/ )'
+    )
 
     parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
@@ -261,14 +270,16 @@ def main():
 
     train_loaders, val_loaders, train_datasets, val_datasets = [], [], [], []
     for train_csv, train_dir in args.training_data:
+        print("Will train on", train_csv, "at directory", train_dir)
         loader, dataset = getImageTrainingLoader(args.num_labels, train_csv, train_dir, True, height, width, args.batch_size)
         train_loaders.append(loader)
         train_datasets.append(dataset)
 
     for val_csv, val_dir in args.validation_data:
+        print("Will validate on", val_csv, "at directory", val_dir)
         loader, dataset = getImageTrainingLoader(args.num_labels, val_csv, val_dir, False, height, width, args.batch_size)
         val_loaders.append(loader)
-        val_dataset.append(dataset)
+        val_datasets.append(dataset)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if len(args.teacher_model) > 0:
@@ -289,7 +300,7 @@ def main():
     model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
         print(f"Loading model weights from {args.output_file}.static_model.pth")
-        model.load_state_dict(torch.load(args.saved_weights))
+        model.load_state_dict(torch.load(args.saved_weights, map_location=device))
     assert (len(args.saved_weights) > 0) != (args.num_epochs > 0)
 
     assert args.num_epochs > 0 or args.temporal_epochs > 0
@@ -306,7 +317,7 @@ def main():
         train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_loaders, val_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
-            model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
+            model.load_state_dict(torch.load(args.output_file + ".static_model.pth", map_location=device))
 
     if args.temporal_epochs > 0:
         model.set_backbone(False)
@@ -315,9 +326,9 @@ def main():
         print(f"Using batch size {batch_size} for temporal model training")
         train_video_loaders, val_video_loaders = [], []
         for datset in train_datasets:
-            train_videos.append(getVideoLoader(dataset, batch_size, device, False))
+            train_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
         for dataset in val_datasets:
-            val_videos.append(getVideoLoader(dataset, batch_size, device, False))
+            val_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
         #temporal_model = TemporalPredictor(model.num_features, 192, args.num_labels).to(device)
         temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
 
