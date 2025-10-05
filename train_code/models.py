@@ -25,7 +25,7 @@ class TimmModel(nn.Module):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
 
-class TemporalPredictor(nn.Module):
+class TemporalTransformer(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_layers=2, num_heads=4):
         super().__init__()
         self.static_model = model
@@ -43,6 +43,9 @@ class TemporalPredictor(nn.Module):
         x = x.permute(1, 0, 2)  # Back to [B, seq_len, hidden_dim]
         out = self.classifier(x)  # [B, seq_len, num_labels]
         return out
+
+    def temporal_parameters(self):
+        return list(self.projection.parameters()) + list(self.transformer.parameters()) + list(self.classifier.parameters())
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels, dilation):
@@ -81,6 +84,9 @@ class TemporalTCN(nn.Module):
         x = x.transpose(1, 2)         # [B, seq_len, 3]
         return x
 
+    def temporal_parameters(self):
+        return list(self.input_proj.parameters()) + list(self.blocks.parameters()) + list(self.output_proj.parameters())
+
 class TemporalLSTM(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_layers, bidirectional=False):
         super().__init__()
@@ -98,3 +104,6 @@ class TemporalLSTM(nn.Module):
         x, _ = self.lstm(x)  # output: [B, seq_len, hidden_dim*2]
         out = self.classifier(x)  # [B, seq_len, num_labels]
         return out
+
+    def temporal_parameters(self):
+        return list(self.lstm.parameters()) + list(self.classifier.parameters())

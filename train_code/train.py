@@ -9,7 +9,7 @@ import random
 import argparse
 from losses import AsymmetricLoss, FocalLoss
 from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageTrainingDataset, getImageTrainingLoader, MultiLabelVideoDataset, getVideoLoader
-from models import TimmModel, TemporalPredictor, TemporalTCN, TemporalLSTM
+from models import TimmModel, TemporalTransformer, TemporalTCN, TemporalLSTM
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -140,7 +140,7 @@ def validateStep(model, dataloader, criterion, device, precision):
                 assert False # outputs dim should be 2 or 3
     return total_loss / len(dataloader)
 
-def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_adamw, optimizer_sgd, sgd_epoch, unfreeze_epoch, num_labels, device, train_loaders, val_loaders, output_file, output_file_ext):
+def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_adamw, optimizer_sgd, sgd_epoch, num_labels, device, train_loaders, val_loaders, output_file, output_file_ext):
     # ---- Optimizer and Loss ----
     criterion = AsymmetricLoss(gamma_pos=0, gamma_neg=4, clip=0.05)
     precision = AveragePrecision(task='multilabel', num_labels=num_labels, average='none')
@@ -169,10 +169,6 @@ def train_loop(num_epochs, model, teacher_model, student_image_size, optimizer_a
         if epoch == sgd_epoch:
             optimizer = optimizer_sgd
             print("Switched to SGD optimizer")
-
-        if epoch == unfreeze_epoch and unfreeze_epoch != 0:
-            model.set_backbone(True)
-            print("Unfroze backbone")
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         for d, train_loader in enumerate(train_loaders):
@@ -212,18 +208,27 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration")
 
     parser.add_argument('--timm_model', type=str, required=True, help='Path to timm model specification')
-    parser.add_argument('--teacher_model', type=str, required=True, help='Path to Timm model specification for teacher model')
+    parser.add_argument('--teacher_model', type=str, default="", help='Path to timm model specification for teacher model')
     parser.add_argument('--num_labels', type=int, required=True, help='Number of labels to predict')
-    parser.add_argument('--saved_weights', type=str, required=True, help='Path to file representing model weights')
+    parser.add_argument('--saved_weights', type=str, default="", help='Path to file representing model weights')
     parser.add_argument('--image_size', type=int, required=True, help='Image Size. Depends on model')
     parser.add_argument('--teacher_image_size', type=int, required=False, help='Image Size for teacher. Depends on model')
     parser.add_argument('--num_epochs', type=int, required=True, help='Total number of static training epochs')
     parser.add_argument('--temporal_epochs', type=int, default=0, help='Total number of temporal training epochs')
     parser.add_argument('--sgd_epoch', type=int, default=-1, help='Epoch at which to switch to SGD')
-    parser.add_argument('--unfreeze_epoch', type=int, default=0, help='Epoch at which to unfreeze the backbone')
 
-    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
-                        help='Batch size for multi-label classification')
+    parser.add_argument(
+        '--training_data', type=parse_string_pairs, nargs='+', required=True,
+        help='List of csv:directory pairs (e.g., --training_data data/train_mlc_data.csv:data/frames/ )'
+    )
+    parser.add_argument(
+        '--validation_data', type=parse_string_pairs, nargs='+', required=True,
+        help='List of csv:directory pairs (e.g., --validation_data data/val_mlc_data.csv:data/frames/ )'
+    )
+
+    parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1, help='Batch size for frame-wise training')
+    parser.add_argument('--temporal_batch_size', type=int, default=2, help='Batch size for video-wise training')
+    parser.add_argument('--temporal_model', type=str, default="lstm", help='How to map frame-wise features to video features')
 
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
     parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
@@ -248,8 +253,6 @@ def main():
     print(f"Num epochs for per-video training: {args.temporal_epochs}")
     if args.sgd_epoch >= 0:
         print(f"Switch to SGD at: {args.sgd_epoch}")
-    if args.unfreeze_epoch > 0:
-        print(f"Unfreeze backbone at: {args.unfreeze_epoch}")
     print(f"Batch size: {args.batch_size}, Image size: {height}x{width}")
     print(f"Learning rates: Adam (backbone={args.backbone_adam_lr}, clf={args.classifier_adam_lr})")
     if args.sgd_epoch >= 0:
@@ -261,14 +264,16 @@ def main():
 
     train_loaders, val_loaders, train_datasets, val_datasets = [], [], [], []
     for train_csv, train_dir in args.training_data:
+        print("Will train on", train_csv, "at directory", train_dir)
         loader, dataset = getImageTrainingLoader(args.num_labels, train_csv, train_dir, True, height, width, args.batch_size)
         train_loaders.append(loader)
         train_datasets.append(dataset)
 
     for val_csv, val_dir in args.validation_data:
+        print("Will validate on", val_csv, "at directory", val_dir)
         loader, dataset = getImageTrainingLoader(args.num_labels, val_csv, val_dir, False, height, width, args.batch_size)
         val_loaders.append(loader)
-        val_dataset.append(dataset)
+        val_datasets.append(dataset)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if len(args.teacher_model) > 0:
@@ -286,10 +291,9 @@ def main():
     print(f"Using timm model {args.timm_model} as backbone")
     model = TimmModel(args.num_labels, args.timm_model).to(device)
  
-    model.set_backbone(args.unfreeze_epoch == 0)
     if len(args.saved_weights) > 0:
         print(f"Loading model weights from {args.output_file}.static_model.pth")
-        model.load_state_dict(torch.load(args.saved_weights))
+        model.load_state_dict(torch.load(args.saved_weights, map_location=device))
     assert (len(args.saved_weights) > 0) != (args.num_epochs > 0)
 
     assert args.num_epochs > 0 or args.temporal_epochs > 0
@@ -303,32 +307,41 @@ def main():
             {'params': model.classifier_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.unfreeze_epoch, args.num_labels, device, train_loaders, val_loaders, args.output_file, ".static_model.pth")
+        train_loop(args.num_epochs, model, teacher_model, args.image_size, optimizer_adamw, optimizer_sgd, args.sgd_epoch, args.num_labels, device, train_loaders, val_loaders, args.output_file, ".static_model.pth")
         if len(args.output_file) > 0:
             print(f"Loading model weights from {args.output_file}.static_model.pth")
-            model.load_state_dict(torch.load(args.output_file + ".static_model.pth"))
+            model.load_state_dict(torch.load(args.output_file + ".static_model.pth", map_location=device))
 
     if args.temporal_epochs > 0:
+        print("Freezing model backbone for temporal training")
         model.set_backbone(False)
         # eval the hidden weights first
-        batch_size = max(2, args.batch_size // 9) # need at least 2 for cutmix. 9 is 18 // 2 for there are 18 frames
-        print(f"Using batch size {batch_size} for temporal model training")
+        print(f"Using batch size {args.temporal_batch_size} for temporal model training")
         train_video_loaders, val_video_loaders = [], []
         for datset in train_datasets:
-            train_videos.append(getVideoLoader(dataset, batch_size, device, False))
+            train_video_loaders.append(getVideoLoader(dataset, args.temporal_batch_size, device, False))
         for dataset in val_datasets:
-            val_videos.append(getVideoLoader(dataset, batch_size, device, False))
-        #temporal_model = TemporalPredictor(model.num_features, 192, args.num_labels).to(device)
-        temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
+            val_video_loaders.append(getVideoLoader(dataset, args.temporal_batch_size, device, False))
+
+        if args.temporal_model == "lstm":
+            temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
+        elif args.temporal_model == "cnn":
+            temporal_model = TemporalTCN(model, 128, args.num_labels, 3).to(device)
+        elif args.temporal_model == "transformer":
+            temporal_model = TemporalTransformer(model, 128, args.num_labels, 3).to(device)
+        else:
+            assert False # temporal_model may only be one of [lstm, cnn, transformer]
 
         optimizer_adamw = torch.optim.AdamW([
-            {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
+            {'params': model.backbone_parameters(), 'lr': args.backbone_adam_lr, 'weight_decay': args.backbone_weight_decay},
+            {'params': temporal_model.temporal_parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},
         ])
         optimizer_sgd = torch.optim.SGD([
-            {'params': temporal_model.parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
+            {'params': model.backbone_parameters(), 'lr': args.backbone_sgd_lr, 'weight_decay': args.backbone_weight_decay},
+            {'params': temporal_model.temporal_parameters(), 'lr': args.classifier_sgd_lr, 'weight_decay': args.classifier_weight_decay},
         ], momentum=0.9, nesterov=True)
 
-        train_loop(args.temporal_epochs, temporal_model, None, None, optimizer_adamw, optimizer_sgd, -1, -1, args.num_labels, device, train_video_loaders, val_video_loaders, args.output_file, ".temporal_model.pth")
+        train_loop(args.temporal_epochs, temporal_model, None, None, optimizer_adamw, optimizer_sgd, -1, args.num_labels, device, train_video_loaders, val_video_loaders, args.output_file, ".temporal_model.pth")
 
 if __name__ == "__main__":
     main()
