@@ -9,7 +9,7 @@ import random
 import argparse
 from losses import AsymmetricLoss, FocalLoss
 from loaders import PadToSquareHeight, CropToSquareHeight, MultiLabelImageTrainingDataset, getImageTrainingLoader, MultiLabelVideoDataset, getVideoLoader
-from models import TimmModel, TemporalPredictor, TemporalTCN, TemporalLSTM
+from models import TimmModel, TemporalTransformer, TemporalTCN, TemporalLSTM
 
 # ==== Training ====
 def mixup_data(x, y, alpha=1.0):
@@ -234,6 +234,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32 if torch.cuda.is_available() else 1,
                         help='Batch size for multi-label classification')
 
+    parser.add_argument('--temporal_model', type=str, default="lstm", help='How to map frame-wise features to video features')
+
     parser.add_argument('--backbone_adam_lr', type=float, default=1e-5, help='Base Adam learning rate')
     parser.add_argument('--classifier_adam_lr', type=float, default=1e-3, help='Classifier Adam learning rate')
     parser.add_argument('--backbone_sgd_lr', type=float, default=1e-3, help='Base SGD learning rate')
@@ -329,8 +331,15 @@ def main():
             train_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
         for dataset in val_datasets:
             val_video_loaders.append(getVideoLoader(dataset, batch_size, device, False))
-        #temporal_model = TemporalPredictor(model.num_features, 192, args.num_labels).to(device)
-        temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
+
+        if args.temporal_model == "lstm":
+            temporal_model = TemporalLSTM(model, 128, args.num_labels, 3).to(device)
+        elif args.temporal_model == "cnn":
+            temporal_model = TemporalTCN(model, 128, args.num_labels, 3).to(device)
+        elif args.temporal_model == "transformer":
+            temporal_model = TemporalTransformer(model, 128, args.num_labels, 3).to(device)
+        else:
+            assert False # temporal_model may only be one of [lstm, cnn, transformer]
 
         optimizer_adamw = torch.optim.AdamW([
             {'params': temporal_model.parameters(), 'lr': args.classifier_adam_lr, 'weight_decay': args.classifier_weight_decay},

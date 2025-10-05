@@ -25,7 +25,7 @@ class TimmModel(nn.Module):
         for param in self.backbone_parameters():
             param.requires_grad = requires_grad
 
-class TemporalPredictor(nn.Module):
+class TemporalTransformer(nn.Module):
     def __init__(self, model, hidden_dim, num_labels, num_layers=2, num_heads=4):
         super().__init__()
         self.static_model = model
